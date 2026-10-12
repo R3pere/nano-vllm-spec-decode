@@ -1,0 +1,2 @@
+# Keep the same source bytes when Windows Git and WSL Git share this checkout.
+* text=auto eol=lf
