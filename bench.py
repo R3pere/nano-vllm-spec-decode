@@ -13,14 +13,22 @@ Workloads (--workload):
           "add type hints", "add docstrings", "fix typos in this text". The material is upstream
           nano-vllm's own source and README at commit bb823b3 (read with git, so it never changes).
           Output ends at EOS or --max-tokens.
+  chat    ordinary questions whose answers don't copy the prompt (explain, write a story, list pros and
+          cons, ...), 8 kinds of request x 8 topics. Output ends at EOS or --max-tokens. Little to copy
+          here, so n-gram guessing mostly misses: this is the everyday case to set against "copy".
+
+--spec-proposer random replaces the n-gram guesses with random tokens (almost never accepted): the worst
+case, which measures the pure cost of checking guesses.
 
 All requests arrive at once unless --rate is given (Poisson arrivals, requests/second).
 --concurrency C keeps at most C requests in flight: a new request is sent only when one finishes,
 and its TTFT is counted from when it is sent. Speculative decoding helps most when few requests
 run together, so test several levels.
 
-Usage: python bench.py [--workload random|copy] [--num-seqs N] [--concurrency C] [--rate R]
-                       [--temperature T] [--enforce-eager] [--spec ngram [--k K]] [--out result.json]
+Usage: python bench.py [--workload random|copy|chat] [--num-seqs N] [--concurrency C] [--rate R]
+                       [--temperature T] [--enforce-eager] [--spec ngram [--k K] [--spec-proposer random]
+                       [--spec-max-batch B]] [--out result.json]
+scripts/bench_matrix.py runs the whole comparison matrix and prints the tables.
 """
 import argparse
 import json
@@ -47,6 +55,18 @@ CODE_TASKS = [
     "Add a one-line docstring to every function in the following Python code that does not have one. Output the complete code and nothing else.",
 ]
 TEXT_TASK = "Fix any spelling or grammar mistakes in the following Markdown text and output the full corrected text, keeping all formatting and links."
+CHAT_TASKS = [
+    "Explain {} to a ten-year-old.",
+    "Write a short story about {}.",
+    "What are the pros and cons of {}?",
+    "Write a poem about {}.",
+    "Give me five interesting facts about {}.",
+    "Write a persuasive paragraph about why {} matters.",
+    "Describe a typical day of someone whose job involves {}.",
+    "What questions would you ask an expert on {}, and why?",
+]
+CHAT_TOPICS = ["volcanoes", "the stock market", "honeybees", "black holes", "the Roman Empire",
+               "machine translation", "coffee", "jazz music"]
 
 
 def read_material(path):
@@ -65,7 +85,17 @@ def copy_prompts(tokenizer, n, rng):
     tasks.append(f"{TEXT_TASK}\n\n{readme}")
     rng.shuffle(tasks)
     tasks = [tasks[i % len(tasks)] for i in range(n)]
-    return [tokenizer.apply_chat_template([{"role": "user", "content": t}], tokenize=True, add_generation_prompt=True, enable_thinking=False) for t in tasks]
+    return chat_template(tokenizer, tasks)
+
+
+def chat_prompts(tokenizer, n, rng):
+    tasks = [task.format(topic) for task in CHAT_TASKS for topic in CHAT_TOPICS]
+    rng.shuffle(tasks)
+    return chat_template(tokenizer, [tasks[i % len(tasks)] for i in range(n)])
+
+
+def chat_template(tokenizer, texts):
+    return [tokenizer.apply_chat_template([{"role": "user", "content": t}], tokenize=True, add_generation_prompt=True, enable_thinking=False) for t in texts]
 
 
 def summarize(values_s):
@@ -76,24 +106,30 @@ def summarize(values_s):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default=os.environ.get("MODEL", os.path.expanduser("~/huggingface/Qwen3-0.6B/")))
-    p.add_argument("--workload", choices=["random", "copy"], default="random")
+    p.add_argument("--workload", choices=["random", "copy", "chat"], default="random")
     p.add_argument("--num-seqs", type=int, default=256)
     p.add_argument("--input-len", type=int, nargs=2, default=[100, 1024], metavar=("MIN", "MAX"), help="random workload")
     p.add_argument("--output-len", type=int, nargs=2, default=[100, 1024], metavar=("MIN", "MAX"), help="random workload")
-    p.add_argument("--max-tokens", type=int, default=768, help="copy workload: output limit")
+    p.add_argument("--max-tokens", type=int, default=768, help="copy and chat workloads: output limit")
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--rate", type=float, default=0, help="requests per second; 0 = all arrive at once")
     p.add_argument("--concurrency", type=int, default=0, help="most requests in flight; 0 = no limit")
     p.add_argument("--enforce-eager", action="store_true")
     p.add_argument("--spec", choices=["ngram"], help="speculative decoding method (default: off)")
     p.add_argument("--k", type=int, default=4, help="guessed tokens checked per step")
+    p.add_argument("--spec-proposer", choices=["ngram", "random"], default="ngram", help="random = worst case, guesses are random tokens")
+    p.add_argument("--spec-max-batch", type=int, default=0, help="guess only when at most this many requests decode together; 0 = default")
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", help="also write the result as JSON")
     args = p.parse_args()
 
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=args.max_model_len,
-              speculative_method=args.spec, num_speculative_tokens=args.k)
+              speculative_method=args.spec, num_speculative_tokens=args.k, spec_max_batch_size=args.spec_max_batch)
+    if args.spec and args.spec_proposer == "random":
+        rng = Random(args.seed)
+        vocab_size = llm.model_runner.config.hf_config.vocab_size
+        llm.proposer.propose = lambda seq, k: [rng.randrange(vocab_size) for _ in range(max(k, 0))]
 
     seed(args.seed)
     n = args.num_seqs
@@ -101,7 +137,8 @@ def main():
         prompts = [[randint(0, 10000) for _ in range(randint(*args.input_len))] for _ in range(n)]
         sampling_params = [SamplingParams(temperature=args.temperature, ignore_eos=True, max_tokens=randint(*args.output_len)) for _ in range(n)]
     else:
-        prompts = copy_prompts(llm.tokenizer, n, Random(args.seed))
+        make_prompts = copy_prompts if args.workload == "copy" else chat_prompts
+        prompts = make_prompts(llm.tokenizer, n, Random(args.seed))
         sampling_params = [SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)] * n
     arrivals = [0.0] * n
     if args.rate > 0:
@@ -156,6 +193,8 @@ def main():
         "enforce_eager": args.enforce_eager,
         "spec": args.spec,
         "k": args.k if args.spec else 0,
+        "spec_proposer": args.spec_proposer if args.spec else None,
+        "spec_max_batch": llm.spec_max_batch_size if args.spec else 0,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "duration_s": duration,

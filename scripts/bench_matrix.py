@@ -1,0 +1,164 @@
+"""Runs the benchmark comparison matrix and prints the tables used in docs/DEVLOG.md.
+
+Every run is one `python bench.py ...` in its own process (a fresh engine each time), saved as
+<out>/<name>.json. Runs whose JSON already exists are skipped, so an interrupted matrix can be resumed;
+delete the directory to measure again. --table-only just prints the tables from existing results.
+
+Sections:
+  copy    "copy" workload (answers mostly repeat the prompt), temperature 0 and 0.6, concurrency 1/4/16/all,
+          eager / CUDA graph / speculative eager / speculative graph
+  chat    "chat" workload (ordinary questions, little to copy), same grid, CUDA graph vs speculative graph
+  k       copy workload, temperature 0, concurrency 4: speculative graph with k = 2, 4, 8
+  random  upstream's random-token workload, 64 requests at once, all four configurations
+  worst   copy workload with random guesses (almost never accepted), concurrency 1/16/all: the pure
+          cost of checking guesses, against the plain runs of the copy section
+
+Usage: MODEL=/path/to/Qwen3-0.6B python scripts/bench_matrix.py [--out results/matrix] [--sections ...] [--table-only]
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+NUM_SEQS = {1: 8, 4: 16, 16: 32, 0: 64}    # concurrency (0 = all at once) -> number of requests
+TEMPERATURES = (0, 0.6)
+CONFIGS = {
+    "eager": ["--enforce-eager"],
+    "graph": [],
+    "spec_eager": ["--enforce-eager", "--spec", "ngram"],
+    "spec_graph": ["--spec", "ngram"],
+}
+SECTIONS = ["copy", "chat", "k", "random", "worst"]
+
+
+def grid_name(workload, t, c, config):
+    return f"{workload}_T{t}_c{c}_{config}"
+
+
+def grid_args(workload, t, c):
+    return ["--workload", workload, "--temperature", str(t), "--concurrency", str(c), "--num-seqs", str(NUM_SEQS[c])]
+
+
+def plan(sections):
+    """(name, bench.py arguments) for every run of the chosen sections."""
+    runs = []
+    for workload, configs in (("copy", list(CONFIGS)), ("chat", ["graph", "spec_graph"])):
+        if workload in sections:
+            for t in TEMPERATURES:
+                for c in NUM_SEQS:
+                    for config in configs:
+                        runs.append((grid_name(workload, t, c, config), grid_args(workload, t, c) + CONFIGS[config]))
+    if "k" in sections:
+        for k in (2, 8):
+            runs.append((f"copy_T0_c4_spec_graph_k{k}", grid_args("copy", 0, 4) + CONFIGS["spec_graph"] + ["--k", str(k)]))
+    if "random" in sections:
+        for config in CONFIGS:
+            runs.append((f"random_{config}", ["--workload", "random", "--num-seqs", "64", "--temperature", "0.6"] + CONFIGS[config]))
+    if "worst" in sections:
+        for c in (1, 16, 0):
+            for config in ("eager", "graph"):    # plain runs, same as in the copy section
+                runs.append((grid_name("copy", 0, c, config), grid_args("copy", 0, c) + CONFIGS[config]))
+            for config in ("spec_eager", "spec_graph"):
+                runs.append((grid_name("copy", 0, c, config) + "_randguess", grid_args("copy", 0, c) + CONFIGS[config] + ["--spec-proposer", "random"]))
+    seen = set()
+    return [r for r in runs if not (r[0] in seen or seen.add(r[0]))]
+
+
+def run_all(runs, out):
+    os.makedirs(out, exist_ok=True)
+    for i, (name, args) in enumerate(runs):
+        path = os.path.join(out, f"{name}.json")
+        if os.path.exists(path):
+            continue
+        print(f"[{i + 1}/{len(runs)}] {name}: bench.py {' '.join(args)}", flush=True)
+        with open(os.path.join(out, f"{name}.log"), "w") as log:
+            subprocess.run([sys.executable, os.path.join(ROOT, "bench.py"), *args, "--out", path], cwd=ROOT, check=True,
+                           stdout=log, stderr=subprocess.STDOUT)
+
+
+def load(out, name):
+    path = os.path.join(out, f"{name}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def cell(r):
+    return f"{r['tpot_ms']['mean']:.1f}ms / {r['output_throughput']:.0f}" if r else "-"
+
+
+def spec_cells(r):
+    if not r:
+        return ["-", "-"]
+    s = r["spec_stats"]
+    return [f"{s['acceptance_rate']:.2f}", f"{s['tokens_per_step']:.2f}"]
+
+
+def table(header, rows):
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    lines += ["| " + " | ".join(row) + " |" for row in rows]
+    print("\n".join(lines) + "\n")
+
+
+def conc_label(c):
+    return "all 64" if c == 0 else str(c)
+
+
+def print_tables(out, sections):
+    for workload, configs in (("copy", list(CONFIGS)), ("chat", ["graph", "spec_graph"])):
+        if workload not in sections:
+            continue
+        for t in TEMPERATURES:
+            print(f"### {workload}, temperature {t}  (TPOT mean / output tok/s)\n")
+            rows = []
+            for c in NUM_SEQS:
+                rs = {config: load(out, grid_name(workload, t, c, config)) for config in configs}
+                gain = ""
+                if rs["graph"] and rs["spec_graph"]:
+                    gain = f"{rs['spec_graph']['output_throughput'] / rs['graph']['output_throughput']:.2f}x"
+                rows.append([conc_label(c)] + [cell(rs[config]) for config in configs] + spec_cells(rs["spec_graph"]) + [gain])
+            table(["concurrency"] + configs + ["acceptance", "tokens/step", "spec_graph vs graph"], rows)
+    if "k" in sections:
+        print("### k (copy, temperature 0, concurrency 4, speculative graph)\n")
+        rows = []
+        for k in (2, 4, 8):
+            r = load(out, f"copy_T0_c4_spec_graph_k{k}" if k != 4 else grid_name("copy", 0, 4, "spec_graph"))
+            rows.append([str(k), cell(r)] + spec_cells(r))
+        table(["k", "TPOT / tok/s", "acceptance", "tokens/step"], rows)
+    if "random" in sections:
+        print("### random-token workload, 64 requests at once, temperature 0.6\n")
+        rows = []
+        for config in CONFIGS:
+            r = load(out, f"random_{config}")
+            rows.append([config, cell(r), f"{r['ttft_ms']['mean'] / 1000:.1f}s" if r else "-"] + (spec_cells(r) if config.startswith("spec") else ["", ""]))
+        table(["config", "TPOT / tok/s", "TTFT mean", "acceptance", "tokens/step"], rows)
+    if "worst" in sections:
+        print("### worst case: random guesses (copy, temperature 0)  (TPOT mean / output tok/s)\n")
+        rows = []
+        for c in (1, 16, 0):
+            plain = {config: load(out, grid_name("copy", 0, c, config)) for config in ("eager", "graph")}
+            worst = {config: load(out, grid_name("copy", 0, c, config) + "_randguess") for config in ("spec_eager", "spec_graph")}
+            row = [conc_label(c)]
+            for base, spec in (("eager", "spec_eager"), ("graph", "spec_graph")):
+                change = f"{worst[spec]['output_throughput'] / plain[base]['output_throughput'] - 1:+.0%}" if plain[base] and worst[spec] else "-"
+                row += [cell(plain[base]), cell(worst[spec]), change]
+            rows.append(row)
+        table(["concurrency", "eager", "spec_eager, random guesses", "change", "graph", "spec_graph, random guesses", "change"], rows)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--out", default=os.path.join(ROOT, "results", "matrix"))
+    p.add_argument("--sections", nargs="+", choices=SECTIONS, default=SECTIONS)
+    p.add_argument("--table-only", action="store_true")
+    args = p.parse_args()
+    if not args.table_only:
+        run_all(plan(args.sections), args.out)
+    print_tables(args.out, args.sections)
+
+
+if __name__ == "__main__":
+    main()
