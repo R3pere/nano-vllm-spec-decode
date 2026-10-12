@@ -45,6 +45,7 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
