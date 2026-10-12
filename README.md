@@ -1,3 +1,14 @@
+> **本分支说明**：这是在上游 nano-vllm（提交 bb823b3）基础上做的个人学习项目，目标是加入投机解码和 KV swap，并测出真实收益。计划和进度见 [docs/PLAN.md](docs/PLAN.md)，每阶段做了什么见 [docs/DEVLOG.md](docs/DEVLOG.md)。下面 “Star History” 之前的内容是上游原文。
+>
+> 常用命令（`MODEL` 指向模型目录，默认 `~/huggingface/Qwen3-0.6B/`）：
+>
+> ```bash
+> MODEL=/path/to/Qwen3-0.6B python tests/test_greedy.py   # 正确性测试
+> MODEL=/path/to/Qwen3-0.6B python bench.py               # 性能测试：TTFT、TPOT、吞吐
+> ```
+>
+> 本分支对上游的改动：`SamplingParams(temperature=0)` 表示贪心采样（上游不允许）。
+
 <p align="center">
 <img width="300" src="assets/logo.png">
 </p>
