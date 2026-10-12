@@ -100,11 +100,16 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+    def num_blocks_to_append(self, seq: Sequence, num_tokens: int) -> int:
+        # a decode step writes KV at positions len(seq)-1 ... len(seq)-2+num_tokens
+        num_needed = (len(seq) - 1 + num_tokens + self.block_size - 1) // self.block_size
+        return max(0, num_needed - len(seq.block_table))
 
-    def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
+    def can_append(self, seq: Sequence, num_tokens: int = 1) -> bool:
+        return len(self.free_block_ids) >= self.num_blocks_to_append(seq, num_tokens)
+
+    def may_append(self, seq: Sequence, num_tokens: int = 1):
+        for _ in range(self.num_blocks_to_append(seq, num_tokens)):
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):

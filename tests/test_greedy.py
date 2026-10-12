@@ -21,9 +21,12 @@ Variants checked:
   graph          - nano-vllm with CUDA Graph
   graph_chunked  - nano-vllm with CUDA Graph and a 512-token budget per step,
                    which forces chunked prefill and prefix-cache hits
+  spec_ngram     - nano-vllm eager with n-gram speculative decoding (k=4)
+  spec_ngram_graph_chunked - the same with CUDA Graph (used for steps where nothing was guessed)
+                   and the 512-token budget
 Each runs in its own process so they don't fight over GPU memory.
 
-Usage: python tests/test_greedy.py [--model PATH] [--max-tokens N] [--tol T]
+Usage: python tests/test_greedy.py [--model PATH] [--max-tokens N] [--tol T] [--variants NAME ...]
 """
 import argparse
 import json
@@ -40,6 +43,8 @@ VARIANTS = {
     "eager": dict(enforce_eager=True),
     "graph": dict(enforce_eager=False),
     "graph_chunked": dict(enforce_eager=False, max_num_batched_tokens=512),
+    "spec_ngram": dict(enforce_eager=True, speculative_method="ngram", num_speculative_tokens=4),
+    "spec_ngram_graph_chunked": dict(enforce_eager=False, max_num_batched_tokens=512, speculative_method="ngram", num_speculative_tokens=4),
 }
 
 QUESTIONS = [
@@ -104,6 +109,9 @@ def run_nanovllm(model, prompts, max_tokens, **kwargs):
     from nanovllm import LLM, SamplingParams
     llm = LLM(model, **kwargs)
     outputs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=max_tokens), use_tqdm=False)
+    if llm.proposer:
+        s = llm.get_spec_stats()
+        print(f"  acceptance rate {s['acceptance_rate']:.2f}, tokens per step {s['tokens_per_step']:.2f}", flush=True)
     return [o["token_ids"] for o in outputs]
 
 
@@ -153,23 +161,24 @@ def first_diff(a, b):
 
 def main(args):
     with tempfile.TemporaryDirectory() as tmp:
-        results = {name: call_worker(name, os.path.join(tmp, f"{name}.json"), args) for name in VARIANTS}
+        names = [n for n in VARIANTS if n in args.variants or n == "eager"]    # eager is the reference for "same as eager"
+        results = {name: call_worker(name, os.path.join(tmp, f"{name}.json"), args) for name in names}
         with open(os.path.join(tmp, "all.json"), "w") as f:
             json.dump(results, f)
         gaps = call_worker("referee", os.path.join(tmp, "gaps.json"), args, inp=os.path.join(tmp, "all.json"))
 
     num_prompts = len(results["eager"])
     print(f"\n{num_prompts} prompts, tolerance {args.tol}")
-    print(f"{'variant':14s} {'tokens':>6s} {'not top-1':>9s} {'worst gap':>9s} {'same as eager':>13s}  verdict")
+    print(f"{'variant':24s} {'tokens':>6s} {'not top-1':>9s} {'worst gap':>9s} {'same as eager':>13s}  verdict")
     all_ok = True
-    for name in VARIANTS:
+    for name in names:
         flat = [g for seq in gaps[name] for g in seq]
         not_top1 = sum(g > 0 for g in flat)
         worst = max(flat)
         same = sum(first_diff(a, b) is None for a, b in zip(results["eager"], results[name]))
         ok = worst <= args.tol
         all_ok &= ok
-        print(f"{name:14s} {len(flat):6d} {not_top1:9d} {worst:9.4f} {same:>6d}/{num_prompts:<6d}  {'OK' if ok else 'FAIL'}")
+        print(f"{name:24s} {len(flat):6d} {not_top1:9d} {worst:9.4f} {same:>6d}/{num_prompts:<6d}  {'OK' if ok else 'FAIL'}")
         if not ok:
             for i, seq in enumerate(gaps[name]):
                 bad = [(j, g) for j, g in enumerate(seq) if g > args.tol]
@@ -184,6 +193,7 @@ if __name__ == "__main__":
     p.add_argument("--model", default=os.environ.get("MODEL", os.path.expanduser("~/huggingface/Qwen3-0.6B/")))
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--tol", type=float, default=0.5, help="max allowed fp32 logit gap below top-1")
+    p.add_argument("--variants", nargs="+", choices=list(VARIANTS), default=list(VARIANTS))
     p.add_argument("--worker", choices=list(VARIANTS) + ["referee"])
     p.add_argument("--inp")
     p.add_argument("--out")

@@ -10,6 +10,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.ngram_proposer import NgramProposer
 
 
 class LLMEngine:
@@ -32,7 +33,22 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.num_spec_tokens = config.num_speculative_tokens
+        self.proposer = NgramProposer(config.prompt_lookup_min, config.prompt_lookup_max) if config.speculative_method == "ngram" else None
+        self.reset_spec_stats()
         atexit.register(self.exit)
+
+    def reset_spec_stats(self):
+        self.spec_stats = dict(num_steps=0, num_drafts=0, num_accepted=0, num_emitted=0)
+
+    def get_spec_stats(self) -> dict:
+        """Speculative decoding counters since the last reset. A "step" here is one decode step of one request.
+        acceptance_rate = accepted guesses / proposed guesses; tokens_per_step = tokens produced per decode step
+        (plain decoding is 1.0)."""
+        s = dict(self.spec_stats)
+        s["acceptance_rate"] = s["num_accepted"] / max(s["num_drafts"], 1)
+        s["tokens_per_step"] = s["num_emitted"] / max(s["num_steps"], 1)
+        return s
 
     def exit(self):
         self.model_runner.call("exit")
@@ -49,10 +65,26 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        if not is_prefill and self.proposer:
+            for seq in seqs:
+                # one step emits at most (guesses + 1) tokens, so don't guess past max_tokens
+                k = min(self.num_spec_tokens, seq.max_tokens - seq.num_completion_tokens - 1)
+                seq.draft_token_ids = self.proposer.propose(seq, k)
+        num_prefill_tokens = sum(seq.num_scheduled_tokens for seq in seqs)
+        num_drafts = sum(len(seq.draft_token_ids) for seq in seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        num_appended = self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if not is_prefill and self.proposer:
+            self.spec_stats["num_steps"] += len(seqs)
+            self.spec_stats["num_drafts"] += num_drafts
+            self.spec_stats["num_accepted"] += sum(len(t) - 1 for t in token_ids)
+            self.spec_stats["num_emitted"] += num_appended
+        for seq in seqs:
+            if seq.is_finished and self.proposer:
+                self.proposer.free(seq)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        # positive: prefill tokens processed; negative: decode tokens produced
+        num_tokens = num_prefill_tokens if is_prefill else -num_appended
         return outputs, num_tokens
 
     def is_finished(self):

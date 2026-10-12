@@ -7,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.sampler import Sampler, verify_drafts
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -98,7 +98,25 @@ class ModelRunner:
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
+        if self.config.speculative_method:
+            self.warmup_verify()
         torch.cuda.empty_cache()
+
+    @torch.inference_mode()
+    def warmup_verify(self):
+        # Verifying guesses produces logits for every query token: up to (1+k) times more rows than plain
+        # decode, e.g. 2560 x 151936 for 512 requests and k=4. The KV cache gets whatever memory is left
+        # after the peak seen during warmup, so run the largest verify once here to include it in the peak.
+        k = self.config.num_speculative_tokens
+        num_seqs = min(self.config.max_num_seqs, self.config.max_num_batched_tokens // (1 + k))
+        set_context(False)
+        hidden_states = torch.zeros(num_seqs * (1 + k), self.config.hf_config.hidden_size)
+        logits = self.model.compute_logits(hidden_states)
+        drafts = torch.zeros(num_seqs, k, dtype=torch.int64)
+        num_drafts = torch.full((num_seqs,), k, dtype=torch.int64)
+        temperatures = torch.ones(num_seqs)
+        verify_drafts(logits, drafts, num_drafts, temperatures)
+        reset_context()
 
     def allocate_kv_cache(self):
         config = self.config
@@ -169,16 +187,23 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
-    def prepare_decode(self, seqs: list[Sequence]):
+    def prepare_decode(self, seqs: list[Sequence], num_query_tokens: int = 1):
+        # Each sequence brings num_query_tokens tokens: its last token (whose KV isn't cached yet), then its
+        # guessed tokens, then padding. Padding is never accepted; its KV lands past the cached length and is
+        # overwritten later. All sequences use the same count so attention can treat q as [seqs, count, ...].
         input_ids = []
         positions = []
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            tokens = [seq.last_token] + seq.draft_token_ids
+            tokens += [tokens[-1]] * (num_query_tokens - len(tokens))
+            start = len(seq) - 1
+            end = start + num_query_tokens
+            input_ids.extend(tokens)
+            positions.extend(range(start, end))
+            context_lens.append(end)
+            slot_mapping.extend(seq.block_table[i // self.block_size] * self.block_size + i % self.block_size for i in range(start, end))
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -194,7 +219,8 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        # CUDA graphs are recorded for one token per sequence only; verifying guesses (several tokens per sequence) runs eagerly
+        if is_prefill or self.enforce_eager or input_ids.size(0) > 512 or input_ids.size(0) != get_context().context_lens.size(0):
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -211,13 +237,31 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
+        """Returns the new tokens of each sequence (one, or several with speculative decoding)."""
+        if not is_prefill and self.config.speculative_method:
+            return self.run_verify(seqs)
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
-        return token_ids
+        return [[token_id] for token_id in token_ids] if self.rank == 0 else None
+
+    @torch.inference_mode()
+    def run_verify(self, seqs: list[Sequence]) -> list[list[int]]:
+        """Speculative decoding: run the last token plus the guesses through the model in one pass, keep
+        the guesses the model agrees with, and add one token chosen by the model."""
+        k = max(len(seq.draft_token_ids) for seq in seqs)
+        input_ids, positions = self.prepare_decode(seqs, 1 + k)
+        drafts = [seq.draft_token_ids + [0] * (k - len(seq.draft_token_ids)) for seq in seqs]
+        drafts = torch.tensor(drafts, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True).view(len(seqs), k)
+        num_drafts = torch.tensor([len(seq.draft_token_ids) for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        temperatures = self.prepare_sample(seqs)
+        logits = self.run_model(input_ids, positions, False)
+        num_accepted, next_tokens = verify_drafts(logits, drafts, num_drafts, temperatures)
+        reset_context()
+        return [seq.draft_token_ids[:a] + [t] for seq, a, t in zip(seqs, num_accepted.tolist(), next_tokens.tolist())]
 
     @torch.inference_mode()
     def capture_cudagraph(self):

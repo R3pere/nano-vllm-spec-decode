@@ -68,8 +68,12 @@ class Attention(nn.Module):
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-        else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
+        else:    # decode: every sequence brings the same number of query tokens (1, or 1+k when verifying guesses)
+            num_seqs = context.context_lens.size(0)
+            q = q.reshape(num_seqs, -1, self.num_heads, self.head_dim)
+            # causal mask is aligned to the bottom right: query i of n sees the cache up to context_len-n+i
+            o = flash_attn_with_kvcache(q, k_cache, v_cache,
+                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True)
+            o = o.view(-1, self.num_heads, self.head_dim)
         return o
