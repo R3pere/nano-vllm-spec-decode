@@ -31,6 +31,13 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        # Batch sizes CUDA graphs are recorded for, keyed by tokens per sequence: 1 (plain decode) and, with
+        # speculative decoding, 1+k (checking k guesses). Known even with enforce_eager, see prepare_decode.
+        k = config.num_speculative_tokens if config.speculative_method else 0
+        max_bs = {1: min(config.max_num_seqs, 512)}
+        if k:
+            max_bs[1 + k] = config.spec_max_batch_size
+        self.graph_bs = {n: [x for x in [1, 2, 4, 8] if x < bs] + list(range(16, bs, 16)) + [bs] for n, bs in max_bs.items()}
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -104,11 +111,11 @@ class ModelRunner:
 
     @torch.inference_mode()
     def warmup_verify(self):
-        # Verifying guesses produces logits for every query token: up to (1+k) times more rows than plain
-        # decode, e.g. 2560 x 151936 for 512 requests and k=4. The KV cache gets whatever memory is left
-        # after the peak seen during warmup, so run the largest verify once here to include it in the peak.
+        # Verifying guesses produces logits for every query token, (1+k) rows per request, e.g. 510 x 151936
+        # for 102 requests and k=4. The KV cache gets whatever memory is left after the peak seen during
+        # warmup, so run the largest verify once here to include it in the peak.
         k = self.config.num_speculative_tokens
-        num_seqs = min(self.config.max_num_seqs, self.config.max_num_batched_tokens // (1 + k))
+        num_seqs = self.config.spec_max_batch_size    # bigger batches don't guess (see LLMEngine.step)
         set_context(False)
         hidden_states = torch.zeros(num_seqs * (1 + k), self.config.hf_config.hidden_size)
         logits = self.model.compute_logits(hidden_states)
@@ -138,9 +145,10 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
+    def prepare_block_tables(self, seqs: list[Sequence], num_padding_seqs: int = 0):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        block_tables += [[-1] * max_len] * num_padding_seqs
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
@@ -204,11 +212,23 @@ class ModelRunner:
             positions.extend(range(start, end))
             context_lens.append(end)
             slot_mapping.extend(seq.block_table[i // self.block_size] * self.block_size + i % self.block_size for i in range(start, end))
+        # With speculative decoding, pad the batch with empty sequences up to a size CUDA graphs are recorded
+        # for, also when running eagerly. cuBLAS and flash-attn results depend slightly on the batch size, so
+        # this way eager and graph compute exactly the same thing and give the same tokens. Empty sequences
+        # write no KV (slot -1) and see nothing (length 0); their outputs are dropped.
+        num_padding = 0
+        sizes = self.graph_bs.get(num_query_tokens) if self.config.speculative_method else None
+        if sizes and len(seqs) <= sizes[-1]:
+            num_padding = next(x for x in sizes if x >= len(seqs)) - len(seqs)
+            input_ids += [0] * (num_padding * num_query_tokens)
+            positions += [0] * (num_padding * num_query_tokens)
+            slot_mapping += [-1] * (num_padding * num_query_tokens)
+            context_lens += [0] * num_padding
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        block_tables = self.prepare_block_tables(seqs, num_padding)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
@@ -219,31 +239,34 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        # CUDA graphs are recorded for one token per sequence only; verifying guesses (several tokens per sequence) runs eagerly
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512 or input_ids.size(0) != get_context().context_lens.size(0):
+        context = get_context()
+        num_tokens = input_ids.size(0)
+        bs = 0 if is_prefill else context.context_lens.size(0)
+        # graphs are recorded for 1 token per sequence (plain decode) and 1+k (checking guesses)
+        graph_bs = None if is_prefill or self.enforce_eager else self.graph_bs.get(num_tokens // bs)
+        if graph_bs is None or bs > graph_bs[-1]:
             return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+        graph = self.graphs[(num_tokens // bs, next(x for x in graph_bs if x >= bs))]
+        graph_vars = self.graph_vars
+        graph_vars["input_ids"][:num_tokens] = input_ids
+        graph_vars["positions"][:num_tokens] = positions
+        graph_vars["slot_mapping"].fill_(-1)    # the graph's unused rows must not write KV
+        graph_vars["slot_mapping"][:num_tokens] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        graph.replay()
+        return self.model.compute_logits(graph_vars["outputs"][:num_tokens])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
         """Returns the new tokens of each sequence (one, or several with speculative decoding)."""
-        if not is_prefill and self.config.speculative_method:
+        if not is_prefill and self.config.speculative_method and any(seq.draft_token_ids for seq in seqs):
             return self.run_verify(seqs)
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
+        if logits is not None and logits.size(0) > len(seqs):    # padding sequences, see prepare_decode
+            logits = logits[:len(seqs)]
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return [[token_id] for token_id in token_ids] if self.rank == 0 else None
@@ -252,13 +275,15 @@ class ModelRunner:
     def run_verify(self, seqs: list[Sequence]) -> list[list[int]]:
         """Speculative decoding: run the last token plus the guesses through the model in one pass, keep
         the guesses the model agrees with, and add one token chosen by the model."""
-        k = max(len(seq.draft_token_ids) for seq in seqs)
+        # Always 1+k tokens per sequence, however many guesses there are: fixed shapes let CUDA graphs be
+        # reused, and eager runs the very same shapes so both give identical results.
+        k = self.config.num_speculative_tokens
         input_ids, positions = self.prepare_decode(seqs, 1 + k)
         drafts = [seq.draft_token_ids + [0] * (k - len(seq.draft_token_ids)) for seq in seqs]
         drafts = torch.tensor(drafts, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True).view(len(seqs), k)
         num_drafts = torch.tensor([len(seq.draft_token_ids) for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         temperatures = self.prepare_sample(seqs)
-        logits = self.run_model(input_ids, positions, False)
+        logits = self.run_model(input_ids, positions, False)[:len(seqs) * (1 + k)]    # drop padding sequences
         num_accepted, next_tokens = verify_drafts(logits, drafts, num_drafts, temperatures)
         reset_context()
         return [seq.draft_token_ids[:a] + [t] for seq, a, t in zip(seqs, num_accepted.tolist(), next_tokens.tolist())]
@@ -267,27 +292,30 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        k = config.num_speculative_tokens if config.speculative_method else 0
+        max_num_tokens = max(n * sizes[-1] for n, sizes in self.graph_bs.items())
+        max_num_seqs = max(sizes[-1] for sizes in self.graph_bs.values())
+        max_num_blocks = (config.max_model_len + k + self.block_size - 1) // self.block_size    # checking guesses writes up to k positions past the end
+        input_ids = torch.zeros(max_num_tokens, dtype=torch.int64)
+        positions = torch.zeros(max_num_tokens, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_num_tokens, dtype=torch.int32)
+        context_lens = torch.zeros(max_num_seqs, dtype=torch.int32)
+        block_tables = torch.zeros(max_num_seqs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_num_tokens, hf_config.hidden_size)
         self.graphs = {}
         self.graph_pool = None
 
-        for bs in reversed(self.graph_bs):
+        # biggest first: all graphs share one memory pool, sized by the first capture
+        shapes = sorted(((n, bs) for n, sizes in self.graph_bs.items() for bs in sizes), key=lambda x: x[0] * x[1], reverse=True)
+        for n, bs in shapes:
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            set_context(False, slot_mapping=slot_mapping[:n * bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            outputs[:n * bs] = self.model(input_ids[:n * bs], positions[:n * bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                outputs[:n * bs] = self.model(input_ids[:n * bs], positions[:n * bs])    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
+            self.graphs[(n, bs)] = graph
             torch.cuda.synchronize()
             reset_context()
 

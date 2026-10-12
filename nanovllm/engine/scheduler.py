@@ -11,6 +11,7 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
+        self.max_model_len = config.max_model_len
         self.block_size = config.kvcache_block_size
         # speculative decoding: each decode step checks up to k guessed tokens, so reserve KV room for 1+k tokens
         self.num_spec_tokens = config.num_speculative_tokens if config.speculative_method else 0
@@ -100,8 +101,10 @@ class Scheduler:
             for token_id in new_token_ids:
                 seq.append_token(token_id)
                 num_appended += 1
-                # one step can produce several tokens, so EOS or max_tokens may be hit midway: drop the rest
-                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                # one step can produce several tokens, so EOS or a length limit may be hit midway: drop the rest.
+                # Stopping at max_model_len keeps block tables within the size CUDA graphs were recorded for.
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens \
+                        or seq.num_tokens == self.max_model_len:
                     seq.status = SequenceStatus.FINISHED
                     break
             num_appended_total += num_appended

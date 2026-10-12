@@ -33,7 +33,9 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.max_model_len = config.max_model_len
         self.num_spec_tokens = config.num_speculative_tokens
+        self.spec_max_batch_size = config.spec_max_batch_size
         self.proposer = NgramProposer(config.prompt_lookup_min, config.prompt_lookup_max) if config.speculative_method == "ngram" else None
         self.reset_spec_stats()
         atexit.register(self.exit)
@@ -59,13 +61,16 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        assert len(prompt) < self.max_model_len, f"prompt has {len(prompt)} tokens, max_model_len is {self.max_model_len}"
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
         return seq
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        if not is_prefill and self.proposer:
+        # big batches don't guess: checking k guesses multiplies the work per step by 1+k, which stops paying
+        # off once the GPU is busy, and there are no CUDA graphs for it
+        if not is_prefill and self.proposer and len(seqs) <= self.spec_max_batch_size:
             for seq in seqs:
                 # one step emits at most (guesses + 1) tokens, so don't guess past max_tokens
                 k = min(self.num_spec_tokens, seq.max_tokens - seq.num_completion_tokens - 1)

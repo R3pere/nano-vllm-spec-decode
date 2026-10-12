@@ -20,6 +20,7 @@ class Config:
     num_speculative_tokens: int = 4          # k: at most k guessed tokens are checked per step
     prompt_lookup_min: int = 2               # ngram: shortest tail to look up in earlier text
     prompt_lookup_max: int = 4               # ngram: longest tail to look up in earlier text
+    spec_max_batch_size: int = 0             # guess only when at most this many requests decode together; 0 = 512 // (1+k)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -32,5 +33,10 @@ class Config:
             assert self.num_speculative_tokens >= 1
             assert self.max_num_batched_tokens >= 1 + self.num_speculative_tokens
             assert 1 <= self.prompt_lookup_min <= self.prompt_lookup_max
+            # checking guesses feeds 1+k tokens per request; like plain decode, CUDA graphs cover up to 512 tokens
+            if self.spec_max_batch_size <= 0:
+                self.spec_max_batch_size = 512 // (1 + self.num_speculative_tokens)
+            self.spec_max_batch_size = min(self.spec_max_batch_size, self.max_num_seqs)
+            assert self.spec_max_batch_size >= 1
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

@@ -160,9 +160,9 @@ def test_verify_distribution():
 BS = 4    # tiny blocks so crossing block boundaries is easy
 
 
-def make_scheduler(num_blocks=32, k=3, eos=99):
+def make_scheduler(num_blocks=32, k=3, eos=99, max_model_len=1000):
     Sequence.block_size = BS
-    config = SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=64, eos=eos, kvcache_block_size=BS,
+    config = SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=64, eos=eos, max_model_len=max_model_len, kvcache_block_size=BS,
                              num_kvcache_blocks=num_blocks, speculative_method="ngram" if k else None,
                              num_speculative_tokens=k)
     return Scheduler(config)
@@ -264,6 +264,12 @@ def test_scheduler():
     assert decode(sched, seq, [99, 99], [99, 99, 99]) == 3 and not seq.is_finished
     sched.running.remove(seq)
     sched.block_manager.deallocate(seq)
+
+    # a request never grows past max_model_len, even when more guesses were kept
+    sched = make_scheduler(max_model_len=10)
+    seq = prefill(sched, [1, 2, 3, 4, 5, 6])    # 7 tokens
+    assert decode(sched, seq, [70, 71, 72], [70, 71, 72, 73]) == 3
+    assert seq.is_finished and len(seq) == 10
     print("scheduler ok")
 
 

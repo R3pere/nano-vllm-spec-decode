@@ -22,9 +22,12 @@ Variants checked:
   graph_chunked  - nano-vllm with CUDA Graph and a 512-token budget per step,
                    which forces chunked prefill and prefix-cache hits
   spec_ngram     - nano-vllm eager with n-gram speculative decoding (k=4)
-  spec_ngram_graph_chunked - the same with CUDA Graph (used for steps where nothing was guessed)
-                   and the 512-token budget
+  spec_ngram_graph - the same with CUDA Graph (checking guesses also runs as a graph)
+  spec_ngram_graph_chunked - the same with the 512-token budget
 Each runs in its own process so they don't fight over GPU memory.
+
+Pairs that run exactly the same computation, only eager vs CUDA Graph, must give identical
+tokens on every prompt (MUST_MATCH): graph = eager, spec_ngram_graph = spec_ngram.
 
 Usage: python tests/test_greedy.py [--model PATH] [--max-tokens N] [--tol T] [--variants NAME ...]
 """
@@ -44,8 +47,10 @@ VARIANTS = {
     "graph": dict(enforce_eager=False),
     "graph_chunked": dict(enforce_eager=False, max_num_batched_tokens=512),
     "spec_ngram": dict(enforce_eager=True, speculative_method="ngram", num_speculative_tokens=4),
+    "spec_ngram_graph": dict(enforce_eager=False, speculative_method="ngram", num_speculative_tokens=4),
     "spec_ngram_graph_chunked": dict(enforce_eager=False, max_num_batched_tokens=512, speculative_method="ngram", num_speculative_tokens=4),
 }
+MUST_MATCH = {"graph": "eager", "spec_ngram_graph": "spec_ngram"}
 
 QUESTIONS = [
     "introduce yourself",
@@ -161,7 +166,9 @@ def first_diff(a, b):
 
 def main(args):
     with tempfile.TemporaryDirectory() as tmp:
-        names = [n for n in VARIANTS if n in args.variants or n == "eager"]    # eager is the reference for "same as eager"
+        # eager is the reference for "same as eager"; MUST_MATCH partners are needed for the exact check
+        wanted = set(args.variants) | {"eager"} | {MUST_MATCH[n] for n in args.variants if n in MUST_MATCH}
+        names = [n for n in VARIANTS if n in wanted]
         results = {name: call_worker(name, os.path.join(tmp, f"{name}.json"), args) for name in names}
         with open(os.path.join(tmp, "all.json"), "w") as f:
             json.dump(results, f)
@@ -177,9 +184,15 @@ def main(args):
         worst = max(flat)
         same = sum(first_diff(a, b) is None for a, b in zip(results["eager"], results[name]))
         ok = worst <= args.tol
+        note = ""
+        if name in MUST_MATCH:
+            partner = MUST_MATCH[name]
+            same_partner = sum(first_diff(a, b) is None for a, b in zip(results[partner], results[name]))
+            note = f"  (same as {partner}: {same_partner}/{num_prompts}, must be all)"
+            ok &= same_partner == num_prompts
         all_ok &= ok
-        print(f"{name:24s} {len(flat):6d} {not_top1:9d} {worst:9.4f} {same:>6d}/{num_prompts:<6d}  {'OK' if ok else 'FAIL'}")
-        if not ok:
+        print(f"{name:24s} {len(flat):6d} {not_top1:9d} {worst:9.4f} {same:>6d}/{num_prompts:<6d}  {'OK' if ok else 'FAIL'}{note}")
+        if worst > args.tol:
             for i, seq in enumerate(gaps[name]):
                 bad = [(j, g) for j, g in enumerate(seq) if g > args.tol]
                 if bad:
