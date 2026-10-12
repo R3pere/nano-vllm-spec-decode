@@ -6,13 +6,17 @@
 > python tests/test_spec_unit.py                          # 投机解码单元测试（只用 CPU，不需要模型）
 > MODEL=/path/to/Qwen3-0.6B python tests/test_greedy.py   # 正确性测试
 > MODEL=/path/to/Qwen3-0.6B python bench.py               # 性能测试：TTFT、TPOT、吞吐
-> MODEL=/path/to/Qwen3-0.6B python bench.py --workload copy --concurrency 4 --enforce-eager --spec ngram   # 投机解码
+> MODEL=/path/to/Qwen3-0.6B python bench.py --workload copy --concurrency 4 --spec ngram   # 投机解码
+> MODEL=/path/to/Qwen3-0.6B python scripts/bench_matrix.py                  # 整张对比表（约 1.5 小时）
+> MODEL=/path/to/Qwen3-0.6B python scripts/step_cost.py                     # 验证一步比普通一步贵多少
+> MODEL=/path/to/Qwen3-0.6B python scripts/profile_decode.py --spec ngram   # 一步 decode 里各部分的耗时
 > ```
 >
 > 本分支对上游的改动：
 > - `SamplingParams(temperature=0)` 表示贪心采样（上游不允许）。
-> - n-gram 投机解码：`LLM(path, speculative_method="ngram", num_speculative_tokens=4)`。每一步先从前文里“照抄”猜几个 token，再让模型一次性检查，猜对的直接收下。贪心和随机采样都支持，输出与不开投机时等价。`llm.get_spec_stats()` 返回接受率等统计。目前检查这一步不走 CUDA Graph（P2 再做），只支持单卡。
-> - `bench.py` 增加了“照抄型”任务（`--workload copy`）和并发上限（`--concurrency`）。
+> - n-gram 投机解码：`LLM(path, speculative_method="ngram", num_speculative_tokens=4)`。每一步先从前文里“照抄”猜几个 token，再让模型一次性检查，猜对的直接收下。贪心和随机采样都支持，输出与不开投机时等价。`llm.get_spec_stats()` 返回接受率等统计。检查这一步也走 CUDA Graph；同时 decode 的请求超过 `spec_max_batch_size`（默认 512 // (1+k)）时这一步不猜。只支持单卡。
+> - 序列长度到 `max_model_len` 就结束（上游不限制，CUDA Graph 下会越界出错）。
+> - `bench.py` 增加了“照抄型”任务（`--workload copy`）、普通问答任务（`--workload chat`）、“随机猜”最坏情况（`--spec-proposer random`）和并发上限（`--concurrency`）。
 
 <p align="center">
 <img width="300" src="assets/logo.png">
