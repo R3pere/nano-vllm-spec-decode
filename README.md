@@ -3,11 +3,16 @@
 > 常用命令（`MODEL` 指向模型目录，默认 `~/huggingface/Qwen3-0.6B/`）：
 >
 > ```bash
+> python tests/test_spec_unit.py                          # 投机解码单元测试（只用 CPU，不需要模型）
 > MODEL=/path/to/Qwen3-0.6B python tests/test_greedy.py   # 正确性测试
 > MODEL=/path/to/Qwen3-0.6B python bench.py               # 性能测试：TTFT、TPOT、吞吐
+> MODEL=/path/to/Qwen3-0.6B python bench.py --workload copy --concurrency 4 --enforce-eager --spec ngram   # 投机解码
 > ```
 >
-> 本分支对上游的改动：`SamplingParams(temperature=0)` 表示贪心采样（上游不允许）。
+> 本分支对上游的改动：
+> - `SamplingParams(temperature=0)` 表示贪心采样（上游不允许）。
+> - n-gram 投机解码：`LLM(path, speculative_method="ngram", num_speculative_tokens=4)`。每一步先从前文里“照抄”猜几个 token，再让模型一次性检查，猜对的直接收下。贪心和随机采样都支持，输出与不开投机时等价。`llm.get_spec_stats()` 返回接受率等统计。目前检查这一步不走 CUDA Graph（P2 再做），只支持单卡。
+> - `bench.py` 增加了“照抄型”任务（`--workload copy`）和并发上限（`--concurrency`）。
 
 <p align="center">
 <img width="300" src="assets/logo.png">

@@ -6,8 +6,9 @@
 
 Workloads (--workload):
   random  same as upstream bench.py: random token prompts (100-1024 tokens), random output lengths
-          (100-1024 tokens), EOS ignored. Nothing in the output can be copied from the input, so
-          n-gram guessing almost never helps; this shows its cost.
+          (100-1024 tokens), EOS ignored. Note: on random prompts the model's output quickly falls
+          into repeating a few tokens, so n-gram guessing works well here (acceptance ~0.8). It is
+          NOT a "nothing to copy" case.
   copy    real editing tasks whose answer mostly repeats the input: "add comments to this code",
           "add type hints", "add docstrings", "fix typos in this text". The material is upstream
           nano-vllm's own source and README at commit bb823b3 (read with git, so it never changes).
