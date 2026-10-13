@@ -12,6 +12,8 @@ Sections:
   random  upstream's random-token workload, 64 requests at once, all four configurations
   worst   copy workload with random guesses (almost never accepted), concurrency 1/16/all: the pure
           cost of checking guesses, against the plain runs of the copy section
+  dynk    dynamic k (n-gram, k at most 8) against the CUDA graph, fixed k=4 and (copy only) fixed k=8,
+          on copy and chat, temperature 0 and 0.6, concurrency 1/4/16/all; plus the random-guess worst case
 
 Usage: MODEL=/path/to/Qwen3-0.6B python scripts/bench_matrix.py [--out results/matrix] [--sections ...] [--table-only]
 """
@@ -30,7 +32,12 @@ CONFIGS = {
     "spec_eager": ["--enforce-eager", "--spec", "ngram"],
     "spec_graph": ["--spec", "ngram"],
 }
-SECTIONS = ["copy", "chat", "k", "random", "worst"]
+DYNK_CONFIGS = {
+    "spec_graph_k8": ["--spec", "ngram", "--k", "8"],
+    "spec_graph_dynk": ["--spec", "ngram", "--k", "8", "--dynamic-k"],
+}
+DYNK_GRID = {"copy": ["graph", "spec_graph", "spec_graph_k8", "spec_graph_dynk"], "chat": ["graph", "spec_graph", "spec_graph_dynk"]}
+SECTIONS = ["copy", "chat", "k", "random", "worst", "dynk"]
 
 
 def grid_name(workload, t, c, config):
@@ -62,6 +69,17 @@ def plan(sections):
                 runs.append((grid_name("copy", 0, c, config), grid_args("copy", 0, c) + CONFIGS[config]))
             for config in ("spec_eager", "spec_graph"):
                 runs.append((grid_name("copy", 0, c, config) + "_randguess", grid_args("copy", 0, c) + CONFIGS[config] + ["--spec-proposer", "random"]))
+    if "dynk" in sections:
+        configs = {**CONFIGS, **DYNK_CONFIGS}
+        for workload, names in DYNK_GRID.items():
+            for t in TEMPERATURES:
+                for c in NUM_SEQS:
+                    for config in names:
+                        runs.append((grid_name(workload, t, c, config), grid_args(workload, t, c) + configs[config]))
+        for c in (1, 16, 0):
+            runs.append((grid_name("copy", 0, c, "graph"), grid_args("copy", 0, c)))
+            for config in ("spec_graph", "spec_graph_dynk"):
+                runs.append((grid_name("copy", 0, c, config) + "_randguess", grid_args("copy", 0, c) + configs[config] + ["--spec-proposer", "random"]))
     seen = set()
     return [r for r in runs if not (r[0] in seen or seen.add(r[0]))]
 
@@ -147,6 +165,40 @@ def print_tables(out, sections):
                 row += [cell(plain[base]), cell(worst[spec]), change]
             rows.append(row)
         table(["concurrency", "eager", "spec_eager, random guesses", "change", "graph", "spec_graph, random guesses", "change"], rows)
+    if "dynk" in sections:
+        for workload, names in DYNK_GRID.items():
+            for t in TEMPERATURES:
+                print(f"### dynamic k: {workload}, temperature {t}  (TPOT mean / output tok/s; k = steps per k)\n")
+                rows = []
+                for c in NUM_SEQS:
+                    rs = {config: load(out, grid_name(workload, t, c, config)) for config in names}
+                    dyn = rs["spec_graph_dynk"]
+                    ratios = [f"{dyn['output_throughput'] / rs[b]['output_throughput']:.2f}x" if dyn and rs[b] else "-"
+                              for b in names if b != "spec_graph_dynk"]
+                    rows.append([conc_label(c)] + [cell(rs[config]) for config in names] + spec_cells(dyn)
+                                + [k_hist(dyn)] + ratios)
+                table(["concurrency"] + names + ["acceptance", "tokens/step", "k"]
+                      + [f"dynk vs {b}" for b in names if b != "spec_graph_dynk"], rows)
+        print("### dynamic k, worst case: random guesses (copy, temperature 0)  (TPOT mean / output tok/s)\n")
+        rows = []
+        for c in (1, 16, 0):
+            graph = load(out, grid_name("copy", 0, c, "graph"))
+            row = [conc_label(c), cell(graph)]
+            for config in ("spec_graph", "spec_graph_dynk"):
+                r = load(out, grid_name("copy", 0, c, config) + "_randguess")
+                row += [cell(r), f"{r['output_throughput'] / graph['output_throughput'] - 1:+.0%}" if r and graph else "-"]
+            row.append(k_hist(load(out, grid_name("copy", 0, c, "spec_graph_dynk") + "_randguess")))
+            rows.append(row)
+        table(["concurrency", "graph", "spec_graph k=4, random guesses", "change", "dynamic k, random guesses", "change", "k"], rows)
+
+
+def k_hist(r):
+    """Share of steps per k, e.g. "0:12% 8:88%"."""
+    if not r or "k_steps" not in r.get("spec_stats", {}):
+        return "-"
+    steps = r["spec_stats"]["k_steps"]
+    total = sum(steps.values())
+    return " ".join(f"{k}:{100 * n / total:.0f}%" for k, n in steps.items())
 
 
 def main():

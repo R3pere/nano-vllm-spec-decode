@@ -3,9 +3,12 @@ step into phases (milliseconds per step, averaged over all decode steps):
 
   schedule      Scheduler.schedule (block reservation)
   ngram         drafting guesses on the CPU
-  prepare       ModelRunner.prepare_decode (Python lists -> GPU tensors)
-  model         the transformer itself (CUDA graph replay, or eager kernels)
-  lm_head       logits (outside the graph, like upstream)
+  choose_k      dynamic k: picking k (not counting ngram)
+  draft         a draft model's guessing: all its steps, including its own data preparation, model runs,
+                logits and sampling (also its 2-token step on steps that don't guess)
+  prepare       ModelRunner.prepare_decode for the big model (Python lists -> GPU tensors)
+  model         the big model's transformer (CUDA graph replay, or eager kernels)
+  lm_head       the big model's logits (outside the graph, like upstream)
   verify        verify_drafts / Sampler (choosing the tokens)
   rest_of_run   the rest of ModelRunner.run: building the guess tensors, copying results back (.tolist())
   postprocess   Scheduler.postprocess (appending tokens, prefix-cache hashes)
@@ -14,7 +17,8 @@ Each phase ends with torch.cuda.synchronize() so GPU work is charged to the phas
 removes the little CPU/GPU overlap there normally is, so the total is a bit above the real step time.
 
 Usage: MODEL=... python scripts/profile_decode.py [--workload copy|chat] [--concurrency 4] [--num-seqs 16]
-                                                   [--enforce-eager] [--spec ngram] [--k 4] [--temperature 0]
+                                                   [--enforce-eager] [--spec ngram|draft] [--draft-model PATH]
+                                                   [--k 4] [--dynamic-k] [--temperature 0]
 """
 import argparse
 import os
@@ -32,7 +36,7 @@ import bench
 from nanovllm import LLM, SamplingParams
 from nanovllm.engine import model_runner as model_runner_module
 
-PHASES = ["schedule", "ngram", "prepare", "model", "lm_head", "verify", "rest_of_run", "postprocess"]
+PHASES = ["schedule", "ngram", "choose_k", "draft", "prepare", "model", "lm_head", "verify", "rest_of_run", "postprocess"]
 
 
 def main():
@@ -44,20 +48,32 @@ def main():
     p.add_argument("--max-tokens", type=int, default=768)
     p.add_argument("--temperature", type=float, default=0)
     p.add_argument("--enforce-eager", action="store_true")
-    p.add_argument("--spec", choices=["ngram"])
+    p.add_argument("--spec", choices=["ngram", "draft"])
+    p.add_argument("--draft-model", help="--spec draft: the model that guesses (default: --model itself)")
     p.add_argument("--k", type=int, default=4)
+    p.add_argument("--dynamic-k", action="store_true")
     args = p.parse_args()
 
-    llm = LLM(args.model, enforce_eager=args.enforce_eager, speculative_method=args.spec, num_speculative_tokens=args.k)
+    llm = LLM(args.model, enforce_eager=args.enforce_eager, speculative_method=args.spec, num_speculative_tokens=args.k,
+              spec_dynamic_k=args.dynamic_k, draft_model=(args.draft_model or args.model) if args.spec == "draft" else None)
     runner, sched = llm.model_runner, llm.scheduler
     step_times = defaultdict(float)    # phase -> seconds, current step
     totals = defaultdict(float)        # phase -> seconds, all decode steps
+    inside_draft = []                  # calls made while drafting count as "draft" only
 
     def timed(name, fn):
         def wrapper(*a, **kw):
+            if inside_draft:
+                return fn(*a, **kw)
             torch.cuda.synchronize()
             t = time.perf_counter()
-            out = fn(*a, **kw)
+            if name == "draft":
+                inside_draft.append(True)
+            try:
+                out = fn(*a, **kw)
+            finally:
+                if name == "draft":
+                    inside_draft.pop()
             torch.cuda.synchronize()
             step_times[name] += time.perf_counter() - t
             return out
@@ -67,8 +83,10 @@ def main():
     sched.postprocess = timed("postprocess", sched.postprocess)
     if llm.proposer:
         llm.proposer.propose = timed("ngram", llm.proposer.propose)
+    llm.choose_num_spec_tokens = timed("choose_and_ngram", llm.choose_num_spec_tokens)
+    runner.run_draft = timed("draft", runner.run_draft)
     runner.prepare_decode = timed("prepare", runner.prepare_decode)
-    runner.run_model = timed("run_model", runner.run_model)
+    runner.run_model = timed("model", runner.run_model)
     runner.model.compute_logits = timed("lm_head", runner.model.compute_logits)
     runner.sampler = timed("verify", runner.sampler)
     model_runner_module.verify_drafts = timed("verify", model_runner_module.verify_drafts)
@@ -100,9 +118,9 @@ def main():
     duration = time.perf_counter() - start
 
     ms = {name: 1000 * v / num_steps for name, v in totals.items()}
-    ms["model"] = ms.get("run_model", 0) - ms.get("lm_head", 0)
-    ms["rest_of_run"] = ms.get("run", 0) - ms.get("prepare", 0) - ms.get("run_model", 0) - ms.get("verify", 0)
-    label = ("spec " if args.spec else "") + ("eager" if args.enforce_eager else "graph")
+    ms["choose_k"] = ms.get("choose_and_ngram", 0) - ms.get("ngram", 0)
+    ms["rest_of_run"] = ms.get("run", 0) - sum(ms.get(x, 0) for x in ("draft", "prepare", "model", "lm_head", "verify"))
+    label = (f"spec {args.spec} " if args.spec else "") + ("dynamic k " if args.dynamic_k else "") + ("eager" if args.enforce_eager else "graph")
     print(f"{label}, {args.workload}, concurrency {args.concurrency}: {num_steps} decode steps, "
           f"{num_tokens / num_steps:.2f} tokens per step (all requests), {num_tokens / duration:.0f} tok/s with syncs")
     print("ms per decode step: " + "  ".join(f"{name} {ms.get(name, 0):.2f}" for name in PHASES) + f"  | step total {ms['step']:.2f}")

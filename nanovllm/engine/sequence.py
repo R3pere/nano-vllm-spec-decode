@@ -3,6 +3,7 @@ from enum import Enum, auto
 from itertools import count
 
 from nanovllm.sampling_params import SamplingParams
+from nanovllm.engine.dynamic_k import PRIOR_ACCEPTED, PRIOR_REJECTED
 
 
 class SequenceStatus(Enum):
@@ -27,6 +28,8 @@ class Sequence:
         self.is_prefill = True
         self.block_table = []
         self.draft_token_ids = []    # speculative decoding: guessed next tokens, checked by the model this step
+        self.spec_accepted = PRIOR_ACCEPTED    # dynamic k: decayed counts of accepted guesses and of rejections
+        self.spec_rejected = PRIOR_REJECTED    # (see dynamic_k.py)
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -60,6 +63,10 @@ class Sequence:
     @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
+
+    def max_drafts(self, k: int) -> int:
+        """Most guesses worth checking: one step emits at most (guesses + 1) tokens, so don't guess past max_tokens."""
+        return max(0, min(k, self.max_tokens - self.num_completion_tokens - 1))
 
     def block(self, i):
         assert 0 <= i < self.num_blocks

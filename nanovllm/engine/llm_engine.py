@@ -11,6 +11,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.ngram_proposer import NgramProposer
+from nanovllm.engine import dynamic_k
 
 
 class LLMEngine:
@@ -32,24 +33,31 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
+        self.config = config
         self.scheduler = Scheduler(config)
         self.max_model_len = config.max_model_len
+        self.spec_method = config.speculative_method
         self.num_spec_tokens = config.num_speculative_tokens
-        self.spec_max_batch_size = config.spec_max_batch_size
+        self.spec_max_batch_size = config.spec_batch_limit(self.num_spec_tokens) if self.spec_method else 0
         self.proposer = NgramProposer(config.prompt_lookup_min, config.prompt_lookup_max) if config.speculative_method == "ngram" else None
+        # dynamic k: how long a step takes for every k and batch size, measured once (see dynamic_k.py)
+        self.step_costs = self.step_cost_buckets = None
+        if self.spec_method and config.spec_dynamic_k:
+            self.step_costs, self.step_cost_buckets = self.model_runner.call("measure_step_costs")
         self.reset_spec_stats()
         atexit.register(self.exit)
 
     def reset_spec_stats(self):
-        self.spec_stats = dict(num_steps=0, num_drafts=0, num_accepted=0, num_emitted=0)
+        self.spec_stats = dict(num_steps=0, num_drafts=0, num_accepted=0, num_emitted=0, k_steps={})
 
     def get_spec_stats(self) -> dict:
         """Speculative decoding counters since the last reset. A "step" here is one decode step of one request.
         acceptance_rate = accepted guesses / proposed guesses; tokens_per_step = tokens produced per decode step
-        (plain decoding is 1.0)."""
+        (plain decoding is 1.0); k_steps[k] = how many engine steps used k (0 = didn't guess)."""
         s = dict(self.spec_stats)
         s["acceptance_rate"] = s["num_accepted"] / max(s["num_drafts"], 1)
         s["tokens_per_step"] = s["num_emitted"] / max(s["num_steps"], 1)
+        s["k_steps"] = dict(sorted(s["k_steps"].items()))
         return s
 
     def exit(self):
@@ -66,24 +74,48 @@ class LLMEngine:
         self.scheduler.add(seq)
         return seq
 
-    def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
+    def choose_num_spec_tokens(self, seqs: list[Sequence]) -> int:
+        """k for this decode step (0 = don't guess). With n-gram, also fills in seq.draft_token_ids."""
         # big batches don't guess: checking k guesses multiplies the work per step by 1+k, which stops paying
         # off once the GPU is busy, and there are no CUDA graphs for it
-        if not is_prefill and self.proposer and len(seqs) <= self.spec_max_batch_size:
+        ks = [k for k in self.config.spec_k_choices if k == 0 or len(seqs) <= self.config.spec_batch_limit(k)]
+        if not any(ks):
+            return 0
+        max_drafts = [seq.max_drafts(max(ks)) for seq in seqs]
+        if self.proposer:
+            # n-gram guesses are free to make, so make them first: how many each request found tells how many it can use
+            for seq, m in zip(seqs, max_drafts):
+                seq.draft_token_ids = self.proposer.propose(seq, m)
+            max_drafts = [len(seq.draft_token_ids) for seq in seqs]
+        if not any(max_drafts):
+            return 0
+        if self.step_costs is None:    # fixed k
+            return max(ks)
+        alphas = [dynamic_k.acceptance(seq.spec_accepted, seq.spec_rejected) for seq in seqs]
+        costs = {k: self.step_costs[k] for k in ks}
+        k = dynamic_k.choose_k(alphas, max_drafts, costs, self.step_cost_buckets)
+        if self.proposer:
             for seq in seqs:
-                # one step emits at most (guesses + 1) tokens, so don't guess past max_tokens
-                k = min(self.num_spec_tokens, seq.max_tokens - seq.num_completion_tokens - 1)
-                seq.draft_token_ids = self.proposer.propose(seq, k)
+                seq.draft_token_ids = seq.draft_token_ids[:k]
+        return k
+
+    def step(self):
+        seqs, is_prefill = self.scheduler.schedule()
+        k = self.choose_num_spec_tokens(seqs) if not is_prefill and self.spec_method else 0
         num_prefill_tokens = sum(seq.num_scheduled_tokens for seq in seqs)
-        num_drafts = sum(len(seq.draft_token_ids) for seq in seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        token_ids = self.model_runner.call("run", seqs, is_prefill, k)
+        if not is_prefill and self.spec_method:
+            # the guesses checked this step (a draft model makes them inside run); postprocess clears them
+            num_drafts = [len(seq.draft_token_ids) for seq in seqs]
+            for seq, m, t in zip(seqs, num_drafts, token_ids):
+                seq.spec_accepted, seq.spec_rejected = dynamic_k.update_counts(seq.spec_accepted, seq.spec_rejected, m, len(t) - 1)
         num_appended = self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        if not is_prefill and self.proposer:
+        if not is_prefill and self.spec_method:
             self.spec_stats["num_steps"] += len(seqs)
-            self.spec_stats["num_drafts"] += num_drafts
+            self.spec_stats["num_drafts"] += sum(num_drafts)
             self.spec_stats["num_accepted"] += sum(len(t) - 1 for t in token_ids)
             self.spec_stats["num_emitted"] += num_appended
+            self.spec_stats["k_steps"][k] = self.spec_stats["k_steps"].get(k, 0) + 1
         for seq in seqs:
             if seq.is_finished and self.proposer:
                 self.proposer.free(seq)

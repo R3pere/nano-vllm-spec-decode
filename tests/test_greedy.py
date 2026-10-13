@@ -24,10 +24,19 @@ Variants checked:
   spec_ngram     - nano-vllm eager with n-gram speculative decoding (k=4)
   spec_ngram_graph - the same with CUDA Graph (checking guesses also runs as a graph)
   spec_ngram_graph_chunked - the same with the 512-token budget
+  spec_draft     - nano-vllm eager, a draft model guesses (k=4); the model guesses for itself here
+                   (two copies of the same model: 1.7B + 0.6B don't fit in 6GB)
+  spec_draft_graph, spec_draft_graph_chunked - the same with CUDA Graph / with the 512-token budget
+  spec_ngram_dynk_graph, spec_draft_dynk_graph - CUDA Graph, k chosen every step (at most 8)
 Each runs in its own process so they don't fight over GPU memory.
 
 Pairs that run exactly the same computation, only eager vs CUDA Graph, must give identical
-tokens on every prompt (MUST_MATCH): graph = eager, spec_ngram_graph = spec_ngram.
+tokens on every prompt (MUST_MATCH): graph = eager, spec_ngram_graph = spec_ngram,
+spec_draft_graph = spec_draft. (Dynamic k picks k from timings, so runs can differ in k and in
+bf16 near-ties; they only face the referee.)
+
+A model guessing for itself should have almost every guess accepted (MIN_ACCEPTANCE). A bug in the
+draft model's KV cache doesn't change the output (the big model checks every guess), only this rate.
 
 Usage: python tests/test_greedy.py [--model PATH] [--max-tokens N] [--tol T] [--variants NAME ...]
 """
@@ -49,8 +58,15 @@ VARIANTS = {
     "spec_ngram": dict(enforce_eager=True, speculative_method="ngram", num_speculative_tokens=4),
     "spec_ngram_graph": dict(enforce_eager=False, speculative_method="ngram", num_speculative_tokens=4),
     "spec_ngram_graph_chunked": dict(enforce_eager=False, max_num_batched_tokens=512, speculative_method="ngram", num_speculative_tokens=4),
+    # draft_model=SELF: the model under test guesses for itself
+    "spec_draft": dict(enforce_eager=True, speculative_method="draft", draft_model="SELF", num_speculative_tokens=4),
+    "spec_draft_graph": dict(enforce_eager=False, speculative_method="draft", draft_model="SELF", num_speculative_tokens=4),
+    "spec_draft_graph_chunked": dict(enforce_eager=False, max_num_batched_tokens=512, speculative_method="draft", draft_model="SELF", num_speculative_tokens=4),
+    "spec_ngram_dynk_graph": dict(enforce_eager=False, speculative_method="ngram", num_speculative_tokens=8, spec_dynamic_k=True),
+    "spec_draft_dynk_graph": dict(enforce_eager=False, speculative_method="draft", draft_model="SELF", num_speculative_tokens=8, spec_dynamic_k=True),
 }
-MUST_MATCH = {"graph": "eager", "spec_ngram_graph": "spec_ngram"}
+MUST_MATCH = {"graph": "eager", "spec_ngram_graph": "spec_ngram", "spec_draft_graph": "spec_draft"}
+MIN_ACCEPTANCE = {name: 0.95 for name in VARIANTS if name.startswith("spec_draft")}
 
 QUESTIONS = [
     "introduce yourself",
@@ -112,12 +128,17 @@ def run_hf_greedy(model, prompts, max_tokens, eos):
 
 def run_nanovllm(model, prompts, max_tokens, **kwargs):
     from nanovllm import LLM, SamplingParams
+    if kwargs.get("draft_model") == "SELF":
+        kwargs = dict(kwargs, draft_model=model)
     llm = LLM(model, **kwargs)
     outputs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=max_tokens), use_tqdm=False)
-    if llm.proposer:
+    acceptance = None
+    if llm.spec_method:
         s = llm.get_spec_stats()
-        print(f"  acceptance rate {s['acceptance_rate']:.2f}, tokens per step {s['tokens_per_step']:.2f}", flush=True)
-    return [o["token_ids"] for o in outputs]
+        acceptance = s["acceptance_rate"]
+        print(f"  acceptance rate {s['acceptance_rate']:.3f}, tokens per step {s['tokens_per_step']:.2f}, "
+              f"steps per k {s['k_steps']}, KV blocks {llm.config.num_kvcache_blocks}", flush=True)
+    return {"tokens": [o["token_ids"] for o in outputs], "acceptance": acceptance}
 
 
 def referee(model, prompts, results):
@@ -142,7 +163,7 @@ def worker(args):
         with open(args.inp) as f:
             result = referee(args.model, prompts, json.load(f))
     elif args.worker == "hf_bf16":
-        result = run_hf_greedy(args.model, prompts, args.max_tokens, eos)
+        result = {"tokens": run_hf_greedy(args.model, prompts, args.max_tokens, eos), "acceptance": None}
     else:
         result = run_nanovllm(args.model, prompts, args.max_tokens, **VARIANTS[args.worker])
     with open(args.out, "w") as f:
@@ -169,7 +190,8 @@ def main(args):
         # eager is the reference for "same as eager"; MUST_MATCH partners are needed for the exact check
         wanted = set(args.variants) | {"eager"} | {MUST_MATCH[n] for n in args.variants if n in MUST_MATCH}
         names = [n for n in VARIANTS if n in wanted]
-        results = {name: call_worker(name, os.path.join(tmp, f"{name}.json"), args) for name in names}
+        runs = {name: call_worker(name, os.path.join(tmp, f"{name}.json"), args) for name in names}
+        results = {name: run["tokens"] for name, run in runs.items()}
         with open(os.path.join(tmp, "all.json"), "w") as f:
             json.dump(results, f)
         gaps = call_worker("referee", os.path.join(tmp, "gaps.json"), args, inp=os.path.join(tmp, "all.json"))
@@ -190,6 +212,10 @@ def main(args):
             same_partner = sum(first_diff(a, b) is None for a, b in zip(results[partner], results[name]))
             note = f"  (same as {partner}: {same_partner}/{num_prompts}, must be all)"
             ok &= same_partner == num_prompts
+        if name in MIN_ACCEPTANCE:
+            acceptance = runs[name]["acceptance"]
+            note += f"  (acceptance {acceptance:.3f}, must be >= {MIN_ACCEPTANCE[name]})"
+            ok &= acceptance >= MIN_ACCEPTANCE[name]
         all_ok &= ok
         print(f"{name:24s} {len(flat):6d} {not_top1:9d} {worst:9.4f} {same:>6d}/{num_prompts:<6d}  {'OK' if ok else 'FAIL'}{note}")
         if worst > args.tol:

@@ -19,6 +19,8 @@ Workloads (--workload):
 
 --spec-proposer random replaces the n-gram guesses with random tokens (almost never accepted): the worst
 case, which measures the pure cost of checking guesses.
+--spec draft --draft-model PATH lets a small model guess. --dynamic-k chooses k every step from the acceptance
+rate, up to --k (with dynamic k, use a larger --k such as 8).
 
 All requests arrive at once unless --rate is given (Poisson arrivals, requests/second).
 --concurrency C keeps at most C requests in flight: a new request is sent only when one finishes,
@@ -26,8 +28,8 @@ and its TTFT is counted from when it is sent. Speculative decoding helps most wh
 run together, so test several levels.
 
 Usage: python bench.py [--workload random|copy|chat] [--num-seqs N] [--concurrency C] [--rate R]
-                       [--temperature T] [--enforce-eager] [--spec ngram [--k K] [--spec-proposer random]
-                       [--spec-max-batch B]] [--out result.json]
+                       [--temperature T] [--enforce-eager] [--spec ngram|draft [--k K] [--dynamic-k]
+                       [--draft-model PATH] [--spec-proposer random] [--spec-max-batch B]] [--out result.json]
 scripts/bench_matrix.py runs the whole comparison matrix and prints the tables.
 """
 import argparse
@@ -115,18 +117,22 @@ def main():
     p.add_argument("--rate", type=float, default=0, help="requests per second; 0 = all arrive at once")
     p.add_argument("--concurrency", type=int, default=0, help="most requests in flight; 0 = no limit")
     p.add_argument("--enforce-eager", action="store_true")
-    p.add_argument("--spec", choices=["ngram"], help="speculative decoding method (default: off)")
-    p.add_argument("--k", type=int, default=4, help="guessed tokens checked per step")
-    p.add_argument("--spec-proposer", choices=["ngram", "random"], default="ngram", help="random = worst case, guesses are random tokens")
+    p.add_argument("--spec", choices=["ngram", "draft"], help="speculative decoding method (default: off)")
+    p.add_argument("--k", type=int, default=4, help="guessed tokens checked per step (with --dynamic-k: at most)")
+    p.add_argument("--dynamic-k", action="store_true", help="choose k every step from the acceptance rate")
+    p.add_argument("--draft-model", help="--spec draft: path of the model that guesses (default: --model itself)")
+    p.add_argument("--spec-proposer", choices=["ngram", "random"], default="ngram", help="random = worst case, n-gram guesses replaced by random tokens")
     p.add_argument("--spec-max-batch", type=int, default=0, help="guess only when at most this many requests decode together; 0 = default")
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", help="also write the result as JSON")
     args = p.parse_args()
 
+    draft_model = (args.draft_model or args.model) if args.spec == "draft" else None
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=args.max_model_len,
-              speculative_method=args.spec, num_speculative_tokens=args.k, spec_max_batch_size=args.spec_max_batch)
-    if args.spec and args.spec_proposer == "random":
+              speculative_method=args.spec, num_speculative_tokens=args.k, spec_max_batch_size=args.spec_max_batch,
+              spec_dynamic_k=args.dynamic_k, draft_model=draft_model)
+    if args.spec == "ngram" and args.spec_proposer == "random":
         rng = Random(args.seed)
         vocab_size = llm.model_runner.config.hf_config.vocab_size
         llm.proposer.propose = lambda seq, k: [rng.randrange(vocab_size) for _ in range(max(k, 0))]
@@ -193,7 +199,10 @@ def main():
         "enforce_eager": args.enforce_eager,
         "spec": args.spec,
         "k": args.k if args.spec else 0,
-        "spec_proposer": args.spec_proposer if args.spec else None,
+        "dynamic_k": args.dynamic_k if args.spec else False,
+        "draft_model": draft_model,
+        "kv_blocks": llm.config.num_kvcache_blocks,
+        "spec_proposer": args.spec_proposer if args.spec == "ngram" else None,
         "spec_max_batch": llm.spec_max_batch_size if args.spec else 0,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -213,7 +222,7 @@ def main():
         print(f"{name[:4].upper()} (ms): mean {s['mean']:.1f}  p50 {s['p50']:.1f}  p99 {s['p99']:.1f}")
     if args.spec:
         s = result["spec_stats"]
-        print(f"speculative: acceptance rate {s['acceptance_rate']:.3f}  tokens per step {s['tokens_per_step']:.2f}")
+        print(f"speculative: acceptance rate {s['acceptance_rate']:.3f}  tokens per step {s['tokens_per_step']:.2f}  steps per k {s['k_steps']}")
     if args.out:
         with open(args.out, "w") as f:
             json.dump(result, f, indent=2)

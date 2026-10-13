@@ -3,7 +3,9 @@
 Covers:
   - n-gram guessing (prompt lookup)
   - the accept/reject rule: greedy cases, plus a statistical test that random sampling with
-    guesses produces exactly the model's distribution (and that the test can tell when it doesn't)
+    guesses produces exactly the model's distribution (and that the test can tell when it doesn't),
+    and the guard for an all-zero residual when the guesser's q equals the model's p
+  - dynamic k: the acceptance estimate and the choice of k
   - KV block reservation for several tokens per step
   - scheduler bookkeeping after a step: guesses kept, EOS / max_tokens in the middle of a step,
     crossing block boundaries, and that only blocks with confirmed KV go into the prefix cache
@@ -89,14 +91,16 @@ def test_verify_greedy():
     print("verify greedy ok")
 
 
-def run_trials(p_logits, temperature, draft_probs, n, verify):
+def run_trials(p_logits, temperature, draft_probs, n, verify, pass_q=True):
     """Run n independent copies of one speculative step with fixed target logits [K+1, V].
-    Guesses are sampled from draft_probs [K, V] (one-hot rows = deterministic n-gram guesses)."""
+    Guesses are sampled from draft_probs [K, V] (one-hot rows = deterministic n-gram guesses).
+    pass_q=False hides q from verify (treats sampled guesses as if they were fixed): a deliberate bug."""
     K = draft_probs.size(0)
     drafts = torch.multinomial(draft_probs, n, replacement=True).T.contiguous()    # [n, K]
     logits = p_logits.unsqueeze(0).expand(n, -1, -1).reshape(n * (K + 1), -1)
     one_hot = bool((draft_probs.max(-1).values == 1).all())
-    q = None if one_hot else draft_probs.unsqueeze(0).expand(n, -1, -1)
+    # verify_drafts takes the draft model's logits; temperature * log(q) gives back q = softmax(logits / temperature)
+    q = None if one_hot or not pass_q else (temperature * draft_probs.log()).unsqueeze(0).expand(n, -1, -1)
     a, t = verify(logits, drafts, torch.full((n,), K), torch.full((n,), temperature), q)
     out = torch.cat([drafts, torch.zeros(n, 1, dtype=torch.int64)], 1)
     out[torch.arange(n), a] = t
@@ -152,7 +156,85 @@ def test_verify_distribution():
         tv_bad, _ = max_tv_distance(p_logits, T, out, lengths)
         print(f"  {name}, deliberately wrong rule: worst TV distance {tv_bad:.4f}")
         assert tv_bad > 3 * tol, (name, tv_bad)    # the test must be able to catch a wrong rule
+
+        if name == "sampled guesses":
+            tokens_with_q = lengths.float().mean().item()
+
+    # The draft model's guesses checked as if they were fixed (q dropped). Not a correctness bug: "keep guess d
+    # with probability p(d), else sample from p without d" gives exactly p for ANY guess d, however it was
+    # chosen. It only keeps fewer guesses than min(1, p(d)/q(d)), so steps produce fewer tokens.
+    out, lengths = run_trials(p_logits, T, q, n, verify_drafts, pass_q=False)
+    tv, _ = max_tv_distance(p_logits, T, out, lengths)
+    tokens_without_q = lengths.float().mean().item()
+    print(f"  sampled guesses checked without q: worst TV distance {tv:.4f}, mean tokens per step {tokens_without_q:.2f}")
+    assert tv < tol and tokens_without_q < tokens_with_q - 0.3, (tv, tokens_without_q, tokens_with_q)
     print("verify distribution ok")
+
+
+def test_verify_zero_residual():
+    """A model guessing for itself: p == q. If a guess is rejected anyway (rounding; forced here with u = 1, as
+    the rule accepts when u * q(d) < p(d)), max(p - q, 0) is all zeros and must not turn into token 0."""
+    V, K, S = 6, 2, 4
+    logits = torch.randn(S, K + 1, V)
+    logits[..., 0] = -float("inf")    # token 0 is impossible, so getting it means the guard failed
+    drafts = torch.full((S, K), 3)
+    draft_logits = logits[:, :K].clone()
+    rand = torch.rand
+    try:
+        torch.rand = lambda *a, **kw: torch.ones(*a, **{x: y for x, y in kw.items() if x != "generator"})
+        a, t = verify_drafts(logits.view(-1, V), drafts, torch.full((S,), K), torch.full((S,), 1.0), draft_logits)
+    finally:
+        torch.rand = rand
+    assert a.tolist() == [0] * S    # every first guess rejected
+    assert (t != 0).all(), t
+    print("verify zero residual ok")
+
+
+# ---------------------------------------------------------------- dynamic k
+
+def test_dynamic_k():
+    from nanovllm.engine.dynamic_k import expected_tokens, acceptance, update_counts, choose_k, PRIOR_ACCEPTED, PRIOR_REJECTED
+    assert expected_tokens(0.0, 4) == 1 and expected_tokens(1.0, 4) == 5
+    assert abs(expected_tokens(0.5, 2) - 1.75) < 1e-9    # 1 + 0.5 + 0.25
+
+    # counting: 3 guesses, 1 accepted -> 1 success and 1 failure; all accepted -> no failure
+    acc, rej = update_counts(0.0, 0.0, 3, 1)
+    assert (acc, rej) == (1, 1)
+    acc, rej = update_counts(0.0, 0.0, 3, 3)
+    assert (acc, rej) == (3, 0)
+    acc, rej = 0.0, 0.0
+    for _ in range(50):    # always all 4 accepted -> alpha goes to ~1
+        acc, rej = update_counts(acc, rej, 4, 4)
+    assert acceptance(acc, rej) > 0.9
+    for _ in range(50):    # always the first rejected -> alpha goes to ~0
+        acc, rej = update_counts(acc, rej, 4, 0)
+    low = acceptance(acc, rej)
+    assert low < 0.2
+    for _ in range(100):    # not checked for a while -> drifts back toward the prior 0.5, so it gets tried again
+        acc, rej = update_counts(acc, rej, 0, 0)
+    assert low < acceptance(acc, rej) <= 0.5
+
+    # A request checked with only 1 guess per step, always kept, must still reach alpha ~1. (A first version added
+    # the prior to every estimate; with 1 guess per step alpha then topped out at ~0.86, which made bigger k look
+    # worse than it is and kept k small: it chose k=1/2 for a model guessing for itself, acceptance 0.99.)
+    acc, rej = PRIOR_ACCEPTED, PRIOR_REJECTED
+    for _ in range(30):
+        acc, rej = update_counts(acc, rej, 1, 1)
+    assert acceptance(acc, rej) > 0.95, acceptance(acc, rej)
+
+    buckets = {0: [1, 2, 4], 2: [1, 2, 4], 4: [1, 2]}
+    flat = {0: [10, 10, 10], 2: [10, 10, 10], 4: [10, 10]}    # guessing is free
+    steep = {0: [10, 10, 10], 2: [20, 20, 20], 4: [30, 30]}    # guessing doubles / triples the step
+    assert choose_k([0.9, 0.9], [4, 4], flat, buckets) == 4
+    assert choose_k([0.0, 0.0], [4, 4], flat, buckets) == 0    # nothing gained: ties go to the smaller k
+    assert choose_k([0.5, 0.5], [4, 4], steep, buckets) == 0    # k=2: 1.75 tokens for 2x the time: no
+    assert choose_k([0.8, 0.8], [4, 4], steep, buckets) == 2    # k=2: 2.44 for 2x (better than k=4: 3.36 for 3x)
+    assert choose_k([0.99, 0.99], [4, 4], steep, buckets) == 4    # k=4: 4.90 for 3x
+    assert choose_k([0.9] * 3, [4] * 3, flat, buckets) == 2    # 3 requests: k=4 isn't allowed (at most 2)
+    assert choose_k([0.9] * 5, [4] * 5, flat, buckets) == 0    # 5 requests: no k > 0 allowed
+    assert choose_k([0.9, 0.9], [0, 0], flat, buckets) == 0    # no guesses available (n-gram found nothing)
+    assert choose_k([0.9, 0.9], [2, 0], flat, buckets) == 2    # k=4 gains nothing over k=2 with only 2 guesses
+    print("dynamic k ok")
 
 
 # ---------------------------------------------------------------- blocks and scheduler
@@ -311,6 +393,8 @@ if __name__ == "__main__":
     test_ngram()
     test_verify_greedy()
     test_verify_distribution()
+    test_verify_zero_residual()
+    test_dynamic_k()
     test_block_reservation()
     test_scheduler()
     test_prefix_cache_after_spec()

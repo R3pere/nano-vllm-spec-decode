@@ -15,8 +15,10 @@
 > 本分支对上游的改动：
 > - `SamplingParams(temperature=0)` 表示贪心采样（上游不允许）。
 > - n-gram 投机解码：`LLM(path, speculative_method="ngram", num_speculative_tokens=4)`。每一步先从前文里“照抄”猜几个 token，再让模型一次性检查，猜对的直接收下。贪心和随机采样都支持，输出与不开投机时等价。`llm.get_spec_stats()` 返回接受率等统计。检查这一步也走 CUDA Graph；同时 decode 的请求超过 `spec_max_batch_size`（默认 512 // (1+k)）时这一步不猜。只支持单卡。
+> - Draft model 投机解码：`LLM(path, speculative_method="draft", draft_model=小模型路径)`，小模型逐个猜 k 个 token，大模型一次检查。两个模型共用块表，各有一份 KV cache。
+> - 动态 k：`spec_dynamic_k=True`（此时 `num_speculative_tokens` 是 k 的上限，建议 8），每一步按各请求最近的接受率和启动时测出的每步耗时选 k（0、1、2、4、8），接受率低时自动不猜。
 > - 序列长度到 `max_model_len` 就结束（上游不限制，CUDA Graph 下会越界出错）。
-> - `bench.py` 增加了“照抄型”任务（`--workload copy`）、普通问答任务（`--workload chat`）、“随机猜”最坏情况（`--spec-proposer random`）和并发上限（`--concurrency`）。
+> - `bench.py` 增加了“照抄型”任务（`--workload copy`）、普通问答任务（`--workload chat`）、“随机猜”最坏情况（`--spec-proposer random`）、并发上限（`--concurrency`），以及 `--spec draft --draft-model 路径`、`--dynamic-k`。
 
 <p align="center">
 <img width="300" src="assets/logo.png">
