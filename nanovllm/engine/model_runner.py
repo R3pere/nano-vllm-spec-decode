@@ -1,4 +1,5 @@
 import pickle
+import sys
 import time
 import torch
 import torch.distributed as dist
@@ -424,6 +425,9 @@ class ModelRunner:
                 sizes = [x for x in sizes if x < most] + [next(x for x in sizes if x >= most)]
             buckets[k], costs[k] = sizes, []
             for bs in sizes:
+                # each bigger batch needs bigger temporaries; without this the allocator keeps every size it has
+                # seen cached and GPU memory runs out (see warn_if_low_memory)
+                torch.cuda.empty_cache()
                 seqs = []
                 for i in range(bs):
                     seq = Sequence([100 + i] * context_len, sp)
@@ -441,7 +445,17 @@ class ModelRunner:
                     torch.cuda.synchronize()
                     times.append(time.perf_counter() - t)
                 costs[k].append(1000 * min(times[1:]))
+        torch.cuda.empty_cache()
         return costs, buckets
+
+    def warn_if_low_memory(self, min_free_mb: int = 300):
+        """Called once setup is done. On WSL / Windows the NVIDIA driver doesn't fail when GPU memory runs out: it
+        quietly puts new allocations in system memory, and every step that touches them becomes very slow."""
+        free = torch.cuda.mem_get_info()[0] // 2**20
+        if free < min_free_mb:
+            print(f"nanovllm: only {free} MB of GPU memory free after startup. On WSL / Windows the driver may then use "
+                  f"system memory instead and run very slowly; try a lower gpu_memory_utilization "
+                  f"(now {self.config.gpu_memory_utilization}).", file=sys.stderr)
 
     @torch.inference_mode()
     def capture_cudagraph(self):

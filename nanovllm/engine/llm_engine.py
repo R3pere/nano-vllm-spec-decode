@@ -44,6 +44,8 @@ class LLMEngine:
         self.step_costs = self.step_cost_buckets = None
         if self.spec_method and config.spec_dynamic_k:
             self.step_costs, self.step_cost_buckets = self.model_runner.call("measure_step_costs")
+        self.num_idle_steps = 0    # dynamic k, draft model: steps in a row that chose k = 0 (see dynamic_k.probe)
+        self.model_runner.warn_if_low_memory()
         self.reset_spec_stats()
         atexit.register(self.exit)
 
@@ -75,7 +77,10 @@ class LLMEngine:
         return seq
 
     def choose_num_spec_tokens(self, seqs: list[Sequence]) -> int:
-        """k for this decode step (0 = don't guess). With n-gram, also fills in seq.draft_token_ids."""
+        """k for this decode step (0 = don't guess). With n-gram, also fills in seq.draft_token_ids, and
+        seq.unchecked_guess when it found guesses but k = 0."""
+        for seq in seqs:
+            seq.unchecked_guess = None
         # big batches don't guess: checking k guesses multiplies the work per step by 1+k, which stops paying
         # off once the GPU is busy, and there are no CUDA graphs for it
         ks = [k for k in self.config.spec_k_choices if k == 0 or len(seqs) <= self.config.spec_batch_limit(k)]
@@ -96,7 +101,12 @@ class LLMEngine:
         k = dynamic_k.choose_k(alphas, max_drafts, costs, self.step_cost_buckets)
         if self.proposer:
             for seq in seqs:
+                if k == 0 and seq.draft_token_ids:
+                    seq.unchecked_guess = seq.draft_token_ids[0]
                 seq.draft_token_ids = seq.draft_token_ids[:k]
+        else:
+            # a draft model's guesses can't be checked for free like n-gram ones (see step), so probe now and then
+            k, self.num_idle_steps = dynamic_k.probe(k, ks, self.num_idle_steps)
         return k
 
     def step(self):
@@ -108,7 +118,14 @@ class LLMEngine:
             # the guesses checked this step (a draft model makes them inside run); postprocess clears them
             num_drafts = [len(seq.draft_token_ids) for seq in seqs]
             for seq, m, t in zip(seqs, num_drafts, token_ids):
-                seq.spec_accepted, seq.spec_rejected = dynamic_k.update_counts(seq.spec_accepted, seq.spec_rejected, m, len(t) - 1)
+                if m == 0 and seq.unchecked_guess is not None:
+                    # n-gram guess not checked (k = 0): the model's own token equals it exactly when checking it
+                    # would have accepted it. Greedy: both mean "it is the argmax". Sampling: it happens with
+                    # probability p(guess), which is exactly the chance the check accepts an n-gram guess. So this
+                    # is a free, unbiased observation of one guess, and alpha doesn't get stuck where k = 0 wins.
+                    seq.spec_accepted, seq.spec_rejected = dynamic_k.update_counts(seq.spec_accepted, seq.spec_rejected, 1, int(t[0] == seq.unchecked_guess))
+                else:
+                    seq.spec_accepted, seq.spec_rejected = dynamic_k.update_counts(seq.spec_accepted, seq.spec_rejected, m, len(t) - 1)
         num_appended = self.scheduler.postprocess(seqs, token_ids, is_prefill)
         if not is_prefill and self.spec_method:
             self.spec_stats["num_steps"] += len(seqs)

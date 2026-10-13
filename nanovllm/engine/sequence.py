@@ -30,6 +30,7 @@ class Sequence:
         self.draft_token_ids = []    # speculative decoding: guessed next tokens, checked by the model this step
         self.spec_accepted = PRIOR_ACCEPTED    # dynamic k: decayed counts of accepted guesses and of rejections
         self.spec_rejected = PRIOR_REJECTED    # (see dynamic_k.py)
+        self.unchecked_guess = None    # dynamic k, n-gram: first guess of a step that chose k = 0 (see LLMEngine.step)
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos

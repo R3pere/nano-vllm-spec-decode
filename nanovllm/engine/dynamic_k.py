@@ -19,6 +19,9 @@ PRIOR_REJECTED = 1.0    # They fade like any observation, so a request whose gue
 DECAY = 0.8             # after each checked step, older observations count less (looks back ~5 steps)
 IDLE_DECAY = 0.95       # after a step without checking, the counts move slowly back to the prior, so a request
                         # that stopped guessing well gets tried again later
+PROBE_INTERVAL = 16     # draft model: after this many steps in a row with k = 0, check the smallest k once anyway.
+                        # In big batches k = 0 can win at the starting alpha 0.5, and without a check alpha is never
+                        # measured, so it would stay 0.5 (and k = 0) for good. One cheap step in 16 costs little.
 
 
 def expected_tokens(alpha: float, m: int) -> float:
@@ -64,3 +67,15 @@ def choose_k(alphas: list[float], max_drafts: list[int], costs: dict[int, list[f
         if tokens / cost > best_rate:
             best_k, best_rate = k, tokens / cost
     return best_k
+
+
+def probe(k: int, ks: list[int], idle_steps: int) -> tuple[int, int]:
+    """Draft model: the k to use given choose_k's pick k, and the new count of steps in a row that chose k = 0
+    although guesses were possible. Every PROBE_INTERVAL-th such step uses the smallest allowed k > 0 instead,
+    so acceptance keeps being measured (see PROBE_INTERVAL)."""
+    if k > 0:
+        return k, 0
+    idle_steps += 1
+    if idle_steps >= PROBE_INTERVAL:
+        return min(x for x in ks if x > 0), 0
+    return 0, idle_steps

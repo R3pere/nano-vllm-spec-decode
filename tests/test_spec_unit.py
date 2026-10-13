@@ -5,7 +5,8 @@ Covers:
   - the accept/reject rule: greedy cases, plus a statistical test that random sampling with
     guesses produces exactly the model's distribution (and that the test can tell when it doesn't),
     and the guard for an all-zero residual when the guesser's q equals the model's p
-  - dynamic k: the acceptance estimate and the choice of k
+  - dynamic k: the acceptance estimate and the choice of k, and that big batches don't get stuck at k = 0
+    (free checks of n-gram guesses, probing with a draft model)
   - KV block reservation for several tokens per step
   - scheduler bookkeeping after a step: guesses kept, EOS / max_tokens in the middle of a step,
     crossing block boundaries, and that only blocks with confirmed KV go into the prefix cache
@@ -237,6 +238,79 @@ def test_dynamic_k():
     print("dynamic k ok")
 
 
+def test_dynamic_k_exploration():
+    """In a big batch, checking costs so much that k > 0 only pays off above the starting alpha 0.5. If nothing
+    were ever checked, alpha would stay 0.5 and k = 0 forever (seen: 64 requests copying text, acceptance 0.81)."""
+    import random
+    from nanovllm.engine.dynamic_k import acceptance, update_counts, choose_k, probe, PRIOR_ACCEPTED, PRIOR_REJECTED, PROBE_INTERVAL
+    bs = 32
+    costs = {0: [10.0], 4: [25.0]}    # k=4: 1.94 tokens at alpha 0.5, 3.36 at 0.8, for 2.5x the time
+    buckets = {0: [bs], 4: [bs]}
+    rng = random.Random(0)
+
+    def run(free_check, steps):
+        """Steps until choose_k picks k > 0 (None if it never does). Every guess is right with probability 0.8."""
+        counts = [(PRIOR_ACCEPTED, PRIOR_REJECTED)] * bs
+        for step in range(steps):
+            k = choose_k([acceptance(a, r) for a, r in counts], [4] * bs, costs, buckets)
+            if k > 0:
+                return step
+            if free_check:    # k = 0, but the model's token tells whether the first guess would have been kept
+                counts = [update_counts(a, r, 1, int(rng.random() < 0.8)) for a, r in counts]
+            else:
+                counts = [update_counts(a, r, 0, 0) for a, r in counts]
+        return None
+
+    assert run(free_check=False, steps=500) is None    # stuck
+    steps = run(free_check=True, steps=500)
+    assert steps is not None and steps <= 10, steps
+
+    # draft model: probe the smallest k after PROBE_INTERVAL steps in a row of k = 0
+    ks, idle, chosen = [0, 2, 4, 8], 0, []
+    for _ in range(2 * PROBE_INTERVAL):
+        k, idle = probe(0, ks, idle)
+        chosen.append(k)
+    assert chosen == ([0] * (PROBE_INTERVAL - 1) + [2]) * 2, chosen
+    assert probe(4, ks, 7) == (4, 0)    # a step that guesses anyway restarts the count
+    print(f"dynamic k exploration ok (k > 0 after {steps} free checks)")
+
+
+def test_engine_choose_k():
+    """LLMEngine.choose_num_spec_tokens without a GPU: unchecked guesses (n-gram) and probing (draft model)."""
+    from nanovllm.engine.llm_engine import LLMEngine
+    from nanovllm.engine.dynamic_k import PROBE_INTERVAL
+    engine = LLMEngine.__new__(LLMEngine)    # only the fields choose_num_spec_tokens reads
+    engine.config = SimpleNamespace(spec_k_choices=[0, 1, 4], spec_batch_limit=lambda k: 4)
+    engine.step_costs = {0: [10.0, 10.0, 10.0], 1: [16.0, 16.0, 16.0], 4: [25.0, 25.0, 25.0]}
+    engine.step_cost_buckets = {0: [1, 2, 4], 1: [1, 2, 4], 4: [1, 2, 4]}
+    engine.num_idle_steps = 0
+
+    engine.proposer = NgramProposer(2, 4)
+    seqs = [Sequence([1, 2, 3, 1, 2]) for _ in range(2)]    # n-gram guesses 3, 1, 2
+    assert engine.choose_num_spec_tokens(seqs) == 0    # alpha 0.5: not worth checking
+    assert all(seq.unchecked_guess == 3 and seq.draft_token_ids == [] for seq in seqs)
+    for seq in seqs:
+        seq.spec_accepted, seq.spec_rejected = 10.0, 0.0
+    assert engine.choose_num_spec_tokens(seqs) == 4
+    assert all(seq.unchecked_guess is None and seq.draft_token_ids == [3, 1, 2] for seq in seqs)
+    for seq in seqs:
+        seq.spec_accepted, seq.spec_rejected = 1.0, 1.0
+    engine.choose_num_spec_tokens(seqs)
+    many = seqs + [Sequence([1, 2, 3, 1, 2]) for _ in range(3)]    # 5 requests: too many to guess at all
+    assert engine.choose_num_spec_tokens(many) == 0
+    assert all(seq.unchecked_guess is None for seq in many)
+    for seq in many:
+        engine.proposer.free(seq)
+    assert engine.num_idle_steps == 0    # n-gram doesn't probe
+
+    engine.proposer = None    # draft model
+    seqs = [Sequence([5] * 10) for _ in range(2)]
+    chosen = [engine.choose_num_spec_tokens(seqs) for _ in range(PROBE_INTERVAL)]
+    assert chosen == [0] * (PROBE_INTERVAL - 1) + [1], chosen
+    assert all(seq.unchecked_guess is None for seq in seqs)
+    print("engine choose k ok")
+
+
 # ---------------------------------------------------------------- blocks and scheduler
 
 BS = 4    # tiny blocks so crossing block boundaries is easy
@@ -395,6 +469,8 @@ if __name__ == "__main__":
     test_verify_distribution()
     test_verify_zero_residual()
     test_dynamic_k()
+    test_dynamic_k_exploration()
+    test_engine_choose_k()
     test_block_reservation()
     test_scheduler()
     test_prefix_cache_after_spec()
