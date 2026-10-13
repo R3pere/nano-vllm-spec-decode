@@ -194,7 +194,7 @@ def test_verify_zero_residual():
 # ---------------------------------------------------------------- dynamic k
 
 def test_dynamic_k():
-    from nanovllm.engine.dynamic_k import expected_tokens, acceptance, update_counts, choose_k, PRIOR_ACCEPTED, PRIOR_REJECTED
+    from nanovllm.engine.dynamic_k import expected_tokens, acceptance, update_counts, choose_k, PRIOR_ACCEPTED, PRIOR_REJECTED, MIN_GAIN
     assert expected_tokens(0.0, 4) == 1 and expected_tokens(1.0, 4) == 5
     assert abs(expected_tokens(0.5, 2) - 1.75) < 1e-9    # 1 + 0.5 + 0.25
 
@@ -235,6 +235,27 @@ def test_dynamic_k():
     assert choose_k([0.9] * 5, [4] * 5, flat, buckets) == 0    # 5 requests: no k > 0 allowed
     assert choose_k([0.9, 0.9], [0, 0], flat, buckets) == 0    # no guesses available (n-gram found nothing)
     assert choose_k([0.9, 0.9], [2, 0], flat, buckets) == 2    # k=4 gains nothing over k=2 with only 2 guesses
+
+    # MIN_GAIN: guesses that are never kept (alpha ~0) give 1 token per request for every k, so k is decided by
+    # the costs alone. At batch size 1 the measured costs are noisy: k=8 can look a hair cheaper than k=0. That
+    # 1% is no reason to guess (seen: k=8 on every step, 13% slower than plain decoding).
+    noisy = {0: [10.0], 4: [10.2], 8: [9.9]}
+    nb = {0: [1], 4: [1], 8: [1]}
+    assert choose_k([0.0], [8], noisy, nb) == 0
+    assert choose_k([0.01], [8], noisy, nb) == 0
+    # just above / just below the threshold: same costs, k=2 gives 1 + a + a^2 tokens against 1
+    even = {0: [10.0], 2: [10.0]}
+    eb = {0: [1], 2: [1]}
+    assert 1 + 0.1 + 0.01 > 1 + MIN_GAIN > 1 + 0.08 + 0.0064
+    assert choose_k([0.1], [2], even, eb) == 2     # 1.11 tokens: 11% more
+    assert choose_k([0.08], [2], even, eb) == 0    # 1.09 tokens: only 9% more
+    # also when the gain comes from a cheaper step: k=2 at 1/1.12 of the time passes, at 1/1.08 it doesn't
+    assert choose_k([0.0], [2], {0: [10.0], 2: [10.0 / 1.12]}, eb) == 2
+    assert choose_k([0.0], [2], {0: [10.0], 2: [10.0 / 1.08]}, eb) == 0
+    # among the k that pass, the best one still wins: k=4 (4.10 tokens) beats k=2 (2.71), both at the cost of k=0
+    assert choose_k([0.9], [4], {0: [10.0], 2: [10.0], 4: [10.0]}, {0: [1], 2: [1], 4: [1]}) == 4
+    # without k = 0 at this batch size there is nothing to beat: the best allowed k as before
+    assert choose_k([0.0] * 3, [4] * 3, {0: [10.0], 2: [10.0, 12.0]}, {0: [2], 2: [2, 4]}) == 2
     print("dynamic k ok")
 
 

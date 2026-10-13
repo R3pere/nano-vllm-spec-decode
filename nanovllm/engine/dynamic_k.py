@@ -11,7 +11,8 @@ independently with probability alpha, a step with m guesses produces on average
 tokens (the guesses kept until the first rejection, plus the one token the model always adds).
 For the whole batch we pick the k with the most tokens per millisecond:
     sum over requests of expected_tokens(alpha, min(k, guesses available)) / costs[k][bucket]
-k = 0 means plain decoding (1 token per request).
+k = 0 means plain decoding (1 token per request). A k > 0 is only picked if its rate beats the rate of k = 0 by
+at least MIN_GAIN (e.g. 10% more tokens per millisecond); otherwise we decode plainly.
 """
 
 PRIOR_ACCEPTED = 1.0    # a new request starts with these counts: alpha = 1 / (1 + 1) = 0.5, so it gets tried.
@@ -22,6 +23,11 @@ IDLE_DECAY = 0.95       # after a step without checking, the counts move slowly 
 PROBE_INTERVAL = 16     # draft model: after this many steps in a row with k = 0, check the smallest k once anyway.
                         # In big batches k = 0 can win at the starting alpha 0.5, and without a check alpha is never
                         # measured, so it would stay 0.5 (and k = 0) for good. One cheap step in 16 costs little.
+MIN_GAIN = 0.1          # a k > 0 must promise at least 10% more tokens per millisecond than k = 0. The measured costs
+                        # are noisy at small batches (k = 8 can even look a hair cheaper than k = 0), a guessing
+                        # step also does CPU work (proposing, bookkeeping) that the cost table doesn't include, and
+                        # new requests start at the prior alpha 0.5 before anything is known. So guessing has to
+                        # clearly pay off, not win by a rounding error.
 
 
 def expected_tokens(alpha: float, m: int) -> float:
@@ -57,15 +63,20 @@ def choose_k(alphas: list[float], max_drafts: list[int], costs: dict[int, list[f
     buckets[k]    the batch-size buckets costs[k] refers to (ascending); k is only allowed if the batch fits
     """
     bs = len(alphas)
-    best_k, best_rate = 0, -1.0
+    rates = {}    # tokens per unit of time for every k allowed at this batch size, ascending k
     for k in sorted(costs):
         sizes = buckets[k]
         if bs > sizes[-1]:
             continue
         cost = costs[k][next(i for i, x in enumerate(sizes) if x >= bs)]
         tokens = sum(expected_tokens(a, min(k, m)) for a, m in zip(alphas, max_drafts))
-        if tokens / cost > best_rate:
-            best_k, best_rate = k, tokens / cost
+        rates[k] = tokens / cost
+    best_k, best_rate = 0, -1.0
+    for k, rate in rates.items():
+        if k > 0 and 0 in rates and rate < (1 + MIN_GAIN) * rates[0]:
+            continue    # not clearly better than plain decoding (see MIN_GAIN)
+        if rate > best_rate:    # strictly better: ties go to the smaller k
+            best_k, best_rate = k, rate
     return best_k
 
 
