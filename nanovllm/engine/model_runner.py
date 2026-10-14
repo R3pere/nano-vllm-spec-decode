@@ -20,6 +20,41 @@ def batch_buckets(max_bs: int) -> list[int]:
     return [x for x in [1, 2, 4, 8] if x < max_bs] + list(range(16, max_bs, 16)) + [max_bs]
 
 
+def mixed_batch(seqs: list[Sequence], k: int, block_size: int) -> dict:
+    """The flat batch of a mixed step, as Python lists (see ModelRunner.prepare_mixed). Each request brings its
+    own query tokens: a decode request its last token plus k guess slots (padded like prepare_decode), a prefill
+    request its chunk. Attention runs as varlen over the paged cache for all of them: this step's KV is stored
+    first, then every query reads positions 0 .. its own position (causal, aligned to the bottom right), so
+    cu_seqlens_k counts each request's whole length up to the end of its query tokens. logits_indices picks the
+    rows that need logits: all 1+k of a decode request, the last row of a prefill request's last chunk, none for
+    an earlier chunk (it produces no token)."""
+    input_ids, positions, slot_mapping, logits_indices = [], [], [], []
+    cu_seqlens_q, cu_seqlens_k = [0], [0]
+    for seq in seqs:
+        if seq.is_prefill:
+            start, end = seq.num_cached_tokens, seq.num_cached_tokens + seq.num_scheduled_tokens
+            input_ids.extend(seq[start:end])
+        else:
+            start, end = len(seq) - 1, len(seq) + k
+            tokens = [seq.last_token] + seq.draft_token_ids
+            input_ids.extend(tokens + [tokens[-1]] * (1 + k - len(tokens)))
+        positions.extend(range(start, end))
+        for i in range(start // block_size, (end + block_size - 1) // block_size):
+            block_start = seq.block_table[i] * block_size
+            slot_mapping.extend(range(block_start + max(start - i * block_size, 0), block_start + min(end - i * block_size, block_size)))
+        q0 = cu_seqlens_q[-1]
+        cu_seqlens_q.append(q0 + end - start)
+        cu_seqlens_k.append(cu_seqlens_k[-1] + end)
+        if not seq.is_prefill:
+            logits_indices.extend(range(q0, q0 + 1 + k))
+        elif end == seq.num_tokens:
+            logits_indices.append(q0 + end - start - 1)
+    return dict(input_ids=input_ids, positions=positions, slot_mapping=slot_mapping, logits_indices=logits_indices,
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max(b - a for a, b in zip(cu_seqlens_q, cu_seqlens_q[1:])),
+                max_seqlen_k=max(b - a for a, b in zip(cu_seqlens_k, cu_seqlens_k[1:])))
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -402,6 +437,57 @@ class ModelRunner:
         num_accepted, next_tokens = verify_drafts(logits, drafts, num_drafts, temperatures, draft_logits)
         reset_context()
         return [seq.draft_token_ids[:a] + [t] for seq, a, t in zip(seqs, num_accepted.tolist(), next_tokens.tolist())]
+
+    def prepare_mixed(self, seqs: list[Sequence], k: int):
+        b = mixed_batch(seqs, k, self.block_size)
+        block_tables = self.prepare_block_tables(seqs)
+        def to_gpu(x, dtype):
+            return torch.tensor(x, dtype=dtype, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, to_gpu(b["cu_seqlens_q"], torch.int32), to_gpu(b["cu_seqlens_k"], torch.int32), b["max_seqlen_q"], b["max_seqlen_k"],
+                    to_gpu(b["slot_mapping"], torch.int32), None, block_tables, to_gpu(b["logits_indices"], torch.int64))
+        return to_gpu(b["input_ids"], torch.int64), to_gpu(b["positions"], torch.int64)
+
+    @torch.inference_mode()
+    def run_mixed(self, seqs: list[Sequence], k: int) -> list[list[int]]:
+        """A step from Scheduler.schedule_mixed: decode requests (checking k guesses each, k may be 0) and prefill
+        chunks. Returns the new tokens of each request, [] for a prefill chunk that isn't the request's last.
+        A step that is all decode or all prefill runs the usual way (so pure decode steps keep their CUDA graphs)."""
+        decode_seqs = [seq for seq in seqs if not seq.is_prefill]
+        prefill_seqs = [seq for seq in seqs if seq.is_prefill]
+        if not prefill_seqs:
+            return self.run(seqs, False, k)
+        if not decode_seqs:
+            token_ids = self.run(seqs, True)
+            return [t if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens else [] for seq, t in zip(seqs, token_ids)]
+        assert self.draft_model is None and self.world_size == 1
+        if not any(seq.draft_token_ids for seq in decode_seqs):
+            k = 0    # nothing to check: 1 token per decode request (the scheduler reserved for 1+k, more than enough)
+        order = seqs
+        seqs = decode_seqs + prefill_seqs    # decode rows come first in the logits
+        input_ids, positions = self.prepare_mixed(seqs, k)
+        hidden_states = self.run_model(input_ids, positions, True)
+        logits = self.model.compute_logits(hidden_states)
+        reset_context()
+        D = len(decode_seqs)
+        temperatures = self.prepare_sample(seqs)
+        if k:
+            drafts = [seq.draft_token_ids + [0] * (k - len(seq.draft_token_ids)) for seq in decode_seqs]
+            drafts = torch.tensor(drafts, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True).view(D, k)
+            num_drafts = torch.tensor([len(seq.draft_token_ids) for seq in decode_seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            num_accepted, next_tokens = verify_drafts(logits[:D * (1 + k)], drafts, num_drafts, temperatures[:D])
+            new_tokens = [seq.draft_token_ids[:a] + [t] for seq, a, t in zip(decode_seqs, num_accepted.tolist(), next_tokens.tolist())]
+        else:
+            new_tokens = [[t] for t in self.sampler(logits[:D], temperatures[:D]).tolist()]
+        done = [seq for seq in prefill_seqs if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens]
+        first_tokens = iter([])
+        if done:
+            rows = logits[D * (1 + k):]
+            temps = torch.tensor([seq.temperature for seq in done], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+            first_tokens = iter(self.sampler(rows, temps).tolist())
+        tokens_of = {id(seq): t for seq, t in zip(decode_seqs, new_tokens)}
+        for seq in prefill_seqs:
+            tokens_of[id(seq)] = [next(first_tokens)] if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens else []
+        return [tokens_of[id(seq)] for seq in order]
 
     def measure_step_costs(self, context_len: int = 512, repeat: int = 3) -> tuple[dict[int, list[float]], dict[int, list[int]]]:
         """For dynamic k: time one decode step (ModelRunner.run, which includes drafting with a draft model) for

@@ -14,6 +14,11 @@ Sections:
           cost of checking guesses, against the plain runs of the copy section
   dynk    dynamic k (n-gram, k at most 8) against the CUDA graph, fixed k=4 and (copy only) fixed k=8,
           on copy and chat, temperature 0 and 0.6, concurrency 1/4/16/all; plus the random-guess worst case
+  mixed   mixed batching under requests that keep arriving (Poisson): long prompts (1-2K tokens) and long
+          outputs (256-512), so new prefills keep interrupting decoding. Upstream scheduling (CUDA graph)
+          against mixed batching with token budgets 256/512/1024/2048 (steps that are all decode use the CUDA
+          graphs, mixed steps run eagerly), mixed batching fully eager at 512, and both with n-gram dynamic k.
+          Reports ITL (P50 / P99 / longest stall), TTFT and throughput.
 
 Usage: MODEL=/path/to/Qwen3-0.6B python scripts/bench_matrix.py [--out results/matrix] [--sections ...] [--table-only]
 """
@@ -37,7 +42,17 @@ DYNK_CONFIGS = {
     "spec_graph_dynk": ["--spec", "ngram", "--k", "8", "--dynamic-k"],
 }
 DYNK_GRID = {"copy": ["graph", "spec_graph", "spec_graph_k8", "spec_graph_dynk"], "chat": ["graph", "spec_graph", "spec_graph_dynk"]}
-SECTIONS = ["copy", "chat", "k", "random", "worst", "dynk"]
+MIXED_RATES = (1.0, 2.0)    # requests per second
+MIXED_BUDGETS = (256, 512, 1024, 2048)
+MIXED_ARGS = ["--workload", "random", "--input-len", "1024", "2048", "--output-len", "256", "512", "--num-seqs", "48"]
+MIXED_CONFIGS = {
+    "graph": [],
+    **{f"mixed{b}": ["--mixed", "--max-num-batched-tokens", str(b)] for b in MIXED_BUDGETS},
+    "mixed512_eager": ["--mixed", "--max-num-batched-tokens", "512", "--enforce-eager"],
+    "spec_dynk": ["--spec", "ngram", "--k", "8", "--dynamic-k"],
+    "mixed512_spec_dynk": ["--mixed", "--max-num-batched-tokens", "512", "--spec", "ngram", "--k", "8", "--dynamic-k"],
+}
+SECTIONS = ["copy", "chat", "k", "random", "worst", "dynk", "mixed"]
 
 
 def grid_name(workload, t, c, config):
@@ -80,6 +95,10 @@ def plan(sections):
             runs.append((grid_name("copy", 0, c, "graph"), grid_args("copy", 0, c)))
             for config in ("spec_graph", "spec_graph_dynk"):
                 runs.append((grid_name("copy", 0, c, config) + "_randguess", grid_args("copy", 0, c) + configs[config] + ["--spec-proposer", "random"]))
+    if "mixed" in sections:
+        for rate in MIXED_RATES:
+            for config, args in MIXED_CONFIGS.items():
+                runs.append((f"mixed_r{rate}_{config}", MIXED_ARGS + ["--rate", str(rate)] + args))
     seen = set()
     return [r for r in runs if not (r[0] in seen or seen.add(r[0]))]
 
@@ -190,6 +209,26 @@ def print_tables(out, sections):
             row.append(k_hist(load(out, grid_name("copy", 0, c, "spec_graph_dynk") + "_randguess")))
             rows.append(row)
         table(["concurrency", "graph", "spec_graph k=4, random guesses", "change", "dynamic k, random guesses", "change", "k"], rows)
+    if "mixed" in sections:
+        print_mixed(out)
+
+
+def print_mixed(out):
+    for rate in MIXED_RATES:
+        print(f"### mixed batching, {rate} requests/s (ms; throughput in output tok/s)
+")
+        rows = []
+        for config in MIXED_CONFIGS:
+            r = load(out, f"mixed_r{rate}_{config}")
+            if not r:
+                rows.append([config] + ["-"] * 9)
+                continue
+            itl, ttft = r["itl_ms"], r["ttft_ms"]
+            rows.append([config, f"{itl['p50']:.1f}", f"{itl['p99']:.1f}", f"{itl['max']:.0f}", f"{ttft['p50']:.0f}",
+                         f"{ttft['p99']:.0f}", f"{r['tpot_ms']['mean']:.1f}", f"{r['output_throughput']:.0f}",
+                         str(r.get("mixed_steps", 0)), str(r.get("preemptions", 0))])
+        table(["config", "ITL P50", "ITL P99", "ITL max", "TTFT P50", "TTFT P99", "TPOT mean", "throughput",
+               "mixed steps", "preemptions"], rows)
 
 
 def k_hist(r):

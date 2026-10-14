@@ -28,11 +28,17 @@ Variants checked:
                    (two copies of the same model: 1.7B + 0.6B don't fit in 6GB)
   spec_draft_graph, spec_draft_graph_chunked - the same with CUDA Graph / with the 512-token budget
   spec_ngram_dynk_graph, spec_draft_dynk_graph - CUDA Graph, k chosen every step (at most 8)
+  mixed_eager    - mixed batching (decode requests and prefill chunks in one step), eager, 256-token
+                   budget so that mixed steps really happen (the long prompts are prefilled in chunks
+                   while the short ones already decode)
+  mixed_graph    - the same with CUDA Graph (steps that are all decode use the graphs, mixed steps run eagerly)
+  mixed_spec_ngram_graph, mixed_spec_ngram_dynk_graph - mixed batching with n-gram guessing, k = 4 / dynamic k
 Each runs in its own process so they don't fight over GPU memory.
 
 Pairs that run exactly the same computation, only eager vs CUDA Graph, must give identical
 tokens on every prompt (MUST_MATCH): graph = eager, spec_ngram_graph = spec_ngram,
-spec_draft_graph = spec_draft. (Dynamic k picks k from timings, so runs can differ in k and in
+spec_draft_graph = spec_draft, mixed_graph = mixed_eager (mixed steps run eagerly in both; steps that
+are all decode use graphs vs eager, which give the same tokens as graph = eager). (Dynamic k picks k from timings, so runs can differ in k and in
 bf16 near-ties; they only face the referee.)
 
 A model guessing for itself should have almost every guess accepted (MIN_ACCEPTANCE). A bug in the
@@ -67,8 +73,12 @@ VARIANTS = {
     "spec_draft_graph_chunked": dict(enforce_eager=False, max_num_batched_tokens=512, speculative_method="draft", draft_model="SELF", num_speculative_tokens=4),
     "spec_ngram_dynk_graph": dict(enforce_eager=False, speculative_method="ngram", num_speculative_tokens=8, spec_dynamic_k=True),
     "spec_draft_dynk_graph": dict(enforce_eager=False, speculative_method="draft", draft_model="SELF", num_speculative_tokens=8, spec_dynamic_k=True),
+    "mixed_eager": dict(enforce_eager=True, enable_mixed_batching=True, max_num_batched_tokens=256),
+    "mixed_graph": dict(enforce_eager=False, enable_mixed_batching=True, max_num_batched_tokens=256),
+    "mixed_spec_ngram_graph": dict(enforce_eager=False, enable_mixed_batching=True, max_num_batched_tokens=256, speculative_method="ngram", num_speculative_tokens=4),
+    "mixed_spec_ngram_dynk_graph": dict(enforce_eager=False, enable_mixed_batching=True, max_num_batched_tokens=256, speculative_method="ngram", num_speculative_tokens=8, spec_dynamic_k=True),
 }
-MUST_MATCH = {"graph": "eager", "spec_ngram_graph": "spec_ngram", "spec_draft_graph": "spec_draft"}
+MUST_MATCH = {"graph": "eager", "spec_ngram_graph": "spec_ngram", "spec_draft_graph": "spec_draft", "mixed_graph": "mixed_eager"}
 MIN_ACCEPTANCE = {name: 0.95 for name in VARIANTS if name.startswith("spec_draft")}
 
 QUESTIONS = [
@@ -136,12 +146,14 @@ def run_nanovllm(model, prompts, max_tokens, **kwargs):
     llm = LLM(model, **kwargs)
     outputs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=max_tokens), use_tqdm=False)
     acceptance = None
+    if llm.config.enable_mixed_batching:
+        print(f"  mixed steps {llm.num_mixed_steps}, preemptions {llm.scheduler.num_preemptions}", flush=True)
     if llm.spec_method:
         s = llm.get_spec_stats()
         acceptance = s["guess_acceptance"]
         print(f"  acceptance rate {s['acceptance_rate']:.3f} (per tested guess {s['guess_acceptance']:.3f}), tokens per step {s['tokens_per_step']:.2f}, "
               f"steps per k {s['k_steps']}, KV blocks {llm.config.num_kvcache_blocks}", flush=True)
-    return {"tokens": [o["token_ids"] for o in outputs], "acceptance": acceptance}
+    return {"tokens": [o["token_ids"] for o in outputs], "acceptance": acceptance, "mixed_steps": llm.num_mixed_steps}
 
 
 def referee(model, prompts, results):
@@ -215,6 +227,10 @@ def main(args):
             same_partner = sum(first_diff(a, b) is None for a, b in zip(results[partner], results[name]))
             note = f"  (same as {partner}: {same_partner}/{num_prompts}, must be all)"
             ok &= same_partner == num_prompts
+        if name.startswith("mixed"):
+            # otherwise the variant would test nothing new
+            note += f"  (mixed steps {runs[name]['mixed_steps']}, must be > 0)"
+            ok &= runs[name]["mixed_steps"] > 0
         if name in MIN_ACCEPTANCE:
             acceptance = runs[name]["acceptance"]
             note += f"  (acceptance per tested guess {acceptance:.3f}, must be >= {MIN_ACCEPTANCE[name]})"

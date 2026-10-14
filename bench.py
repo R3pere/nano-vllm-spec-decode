@@ -3,6 +3,9 @@
   TTFT (time to first token)   = first token time - request arrival time
   TPOT (time per output token) = (finish time - first token time) / (output tokens - 1)
   throughput                   = output tokens / total wall time
+  ITL (inter-token latency)    = time between two moments a request receives new tokens, over all requests.
+                                 Reported as P50, P99 and max (the longest stall any request saw). With
+                                 speculative decoding one step can bring several tokens: that is one gap.
 
 Workloads (--workload):
   random  same as upstream bench.py: random token prompts (100-1024 tokens), random output lengths
@@ -23,13 +26,17 @@ case, which measures the pure cost of checking guesses.
 rate, up to --k (with dynamic k, use a larger --k such as 8).
 
 All requests arrive at once unless --rate is given (Poisson arrivals, requests/second).
+--mixed runs decode requests and prefill chunks in the same step (enable_mixed_batching); then
+--max-num-batched-tokens (the token budget per step) decides how big the prefill chunks can get.
+
 --concurrency C keeps at most C requests in flight: a new request is sent only when one finishes,
 and its TTFT is counted from when it is sent. Speculative decoding helps most when few requests
 run together, so test several levels.
 
 Usage: python bench.py [--workload random|copy|chat] [--num-seqs N] [--concurrency C] [--rate R]
                        [--temperature T] [--enforce-eager] [--spec ngram|draft [--k K] [--dynamic-k]
-                       [--draft-model PATH] [--spec-proposer random] [--spec-max-batch B]] [--out result.json]
+                       [--draft-model PATH] [--spec-proposer random] [--spec-max-batch B]]
+                       [--mixed] [--max-num-batched-tokens N] [--out result.json]
 scripts/bench_matrix.py runs the whole comparison matrix and prints the tables.
 """
 import argparse
@@ -102,7 +109,7 @@ def chat_template(tokenizer, texts):
 
 def summarize(values_s):
     ms = np.array(values_s) * 1000
-    return {"mean": float(ms.mean()), "p50": float(np.percentile(ms, 50)), "p99": float(np.percentile(ms, 99))}
+    return {"mean": float(ms.mean()), "p50": float(np.percentile(ms, 50)), "p99": float(np.percentile(ms, 99)), "max": float(ms.max())}
 
 
 def main():
@@ -123,6 +130,8 @@ def main():
     p.add_argument("--draft-model", help="--spec draft: path of the model that guesses (default: --model itself)")
     p.add_argument("--spec-proposer", choices=["ngram", "random"], default="ngram", help="random = worst case, n-gram guesses replaced by random tokens")
     p.add_argument("--spec-max-batch", type=int, default=0, help="guess only when at most this many requests decode together; 0 = default")
+    p.add_argument("--mixed", action="store_true", help="mixed batching: decode requests and prefill chunks in one step")
+    p.add_argument("--max-num-batched-tokens", type=int, default=16384, help="token budget per step")
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", help="also write the result as JSON")
@@ -131,7 +140,8 @@ def main():
     draft_model = (args.draft_model or args.model) if args.spec == "draft" else None
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=args.max_model_len,
               speculative_method=args.spec, num_speculative_tokens=args.k, spec_max_batch_size=args.spec_max_batch,
-              spec_dynamic_k=args.dynamic_k, draft_model=draft_model)
+              spec_dynamic_k=args.dynamic_k, draft_model=draft_model,
+              enable_mixed_batching=args.mixed, max_num_batched_tokens=args.max_num_batched_tokens)
     if args.spec == "ngram" and args.spec_proposer == "random":
         rng = Random(args.seed)
         vocab_size = llm.model_runner.config.hf_config.vocab_size
@@ -160,10 +170,13 @@ def main():
     llm.generate(warmup[:1], SamplingParams(temperature=args.temperature, max_tokens=32), use_tqdm=False)
     llm.generate(warmup, SamplingParams(temperature=args.temperature, max_tokens=32), use_tqdm=False)
     llm.reset_spec_stats()
+    llm.num_mixed_steps = llm.scheduler.num_preemptions = 0
 
     seqs = [None] * n
     first_token = [None] * n
     finish = [None] * n
+    token_times = [[] for _ in range(n)]    # when each request received new tokens (one entry per step that brought some)
+    num_seen = [0] * n
     running = set()
     next_req = 0
     start = time.perf_counter()
@@ -180,6 +193,9 @@ def main():
         llm.step()
         now = time.perf_counter() - start
         for i in list(running):
+            if seqs[i].num_completion_tokens > num_seen[i]:
+                num_seen[i] = seqs[i].num_completion_tokens
+                token_times[i].append(now)
             if first_token[i] is None and seqs[i].num_completion_tokens > 0:
                 first_token[i] = now
             if seqs[i].is_finished:
@@ -211,15 +227,21 @@ def main():
         "total_throughput": (input_tokens + output_tokens) / duration,
         "ttft_ms": summarize([first_token[i] - arrivals[i] for i in range(n)]),
         "tpot_ms": summarize([(finish[i] - first_token[i]) / max(output_lens[i] - 1, 1) for i in range(n)]),
+        "itl_ms": summarize([b - a for times in token_times for a, b in zip(times, times[1:])] or [0.0]),
+        "mixed": args.mixed,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "mixed_steps": llm.num_mixed_steps,
+        "preemptions": llm.scheduler.num_preemptions,
     }
     if args.spec:
         result["spec_stats"] = llm.get_spec_stats()
 
     print(f"requests: {n}  input tokens: {input_tokens}  output tokens: {output_tokens}  time: {duration:.2f}s")
     print(f"throughput: {result['output_throughput']:.1f} output tok/s, {result['total_throughput']:.1f} total tok/s")
-    for name in ("ttft_ms", "tpot_ms"):
+    for name in ("ttft_ms", "tpot_ms", "itl_ms"):
         s = result[name]
-        print(f"{name[:4].upper()} (ms): mean {s['mean']:.1f}  p50 {s['p50']:.1f}  p99 {s['p99']:.1f}")
+        print(f"{name[:4].upper().rstrip('_')} (ms): mean {s['mean']:.1f}  p50 {s['p50']:.1f}  p99 {s['p99']:.1f}  max {s['max']:.1f}")
+    print(f"mixed steps: {result['mixed_steps']}  preemptions: {result['preemptions']}")
     if args.spec:
         s = result["spec_stats"]
         print(f"speculative: acceptance rate {s['acceptance_rate']:.3f}  tokens per step {s['tokens_per_step']:.2f}  steps per k {s['k_steps']}")

@@ -45,6 +45,9 @@ class LLMEngine:
         if self.spec_method and config.spec_dynamic_k:
             self.step_costs, self.step_cost_buckets = self.model_runner.call("measure_step_costs")
         self.num_idle_steps = 0    # dynamic k, draft model: steps in a row that chose k = 0 (see dynamic_k.probe)
+        self.num_mixed_steps = 0    # steps that ran decode requests and prefill chunks together
+        if self.spec_method == "ngram":    # mixed batching chooses k while scheduling (draft model: no mixing)
+            self.scheduler.choose_num_spec_tokens = self.choose_num_spec_tokens
         self.model_runner.warn_if_low_memory()
         self.reset_spec_stats()
         atexit.register(self.exit)
@@ -80,14 +83,16 @@ class LLMEngine:
         self.scheduler.add(seq)
         return seq
 
-    def choose_num_spec_tokens(self, seqs: list[Sequence]) -> int:
-        """k for this decode step (0 = don't guess). With n-gram, also fills in seq.draft_token_ids, and
-        seq.unchecked_guess when it found guesses but k = 0."""
+    def choose_num_spec_tokens(self, seqs: list[Sequence], max_k: int | None = None) -> int:
+        """k for this decode step (0 = don't guess), at most max_k (mixed batching: what the step can afford).
+        With n-gram, also fills in seq.draft_token_ids, and seq.unchecked_guess when it found guesses but k = 0."""
         for seq in seqs:
             seq.unchecked_guess = None
         # big batches don't guess: checking k guesses multiplies the work per step by 1+k, which stops paying
         # off once the GPU is busy, and there are no CUDA graphs for it
         ks = [k for k in self.config.spec_k_choices if k == 0 or len(seqs) <= self.config.spec_batch_limit(k)]
+        if max_k is not None:
+            ks = [k for k in ks if k <= max_k]
         if not any(ks):
             return 0
         max_drafts = [seq.max_drafts(max(ks)) for seq in seqs]
@@ -114,14 +119,23 @@ class LLMEngine:
         return k
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        k = self.choose_num_spec_tokens(seqs) if not is_prefill and self.spec_method else 0
-        num_prefill_tokens = sum(seq.num_scheduled_tokens for seq in seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill, k)
-        if not is_prefill and self.spec_method:
+        if self.config.enable_mixed_batching:
+            # decode requests and prefill chunks in one step; k is chosen inside schedule_mixed
+            seqs, k = self.scheduler.schedule_mixed()
+            num_prefill_tokens = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+            token_ids = self.model_runner.call("run_mixed", seqs, k)
+        else:
+            seqs, is_prefill = self.scheduler.schedule()
+            k = self.choose_num_spec_tokens(seqs) if not is_prefill and self.spec_method else 0
+            num_prefill_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else 0
+            token_ids = self.model_runner.call("run", seqs, is_prefill, k)
+        decode = [(seq, t) for seq, t in zip(seqs, token_ids) if not seq.is_prefill]
+        if decode and num_prefill_tokens:
+            self.num_mixed_steps += 1
+        if decode and self.spec_method:
             # the guesses checked this step (a draft model makes them inside run); postprocess clears them
-            num_drafts = [len(seq.draft_token_ids) for seq in seqs]
-            for seq, m, t in zip(seqs, num_drafts, token_ids):
+            num_drafts = [len(seq.draft_token_ids) for seq, _ in decode]
+            for (seq, t), m in zip(decode, num_drafts):
                 if m == 0 and seq.unchecked_guess is not None:
                     # n-gram guess not checked (k = 0): the model's own token equals it exactly when checking it
                     # would have accepted it. Greedy: both mean "it is the argmax". Sampling: it happens with
@@ -130,20 +144,22 @@ class LLMEngine:
                     seq.spec_accepted, seq.spec_rejected = dynamic_k.update_counts(seq.spec_accepted, seq.spec_rejected, 1, int(t[0] == seq.unchecked_guess))
                 else:
                     seq.spec_accepted, seq.spec_rejected = dynamic_k.update_counts(seq.spec_accepted, seq.spec_rejected, m, len(t) - 1)
-        num_appended = self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        if not is_prefill and self.spec_method:
-            self.spec_stats["num_steps"] += len(seqs)
+        decode_lens = [len(seq) for seq, _ in decode]
+        self.scheduler.postprocess(seqs, token_ids)
+        num_emitted = sum(len(seq) - n for (seq, _), n in zip(decode, decode_lens))    # by decode requests
+        if decode and self.spec_method:
+            self.spec_stats["num_steps"] += len(decode)
             self.spec_stats["num_drafts"] += sum(num_drafts)
-            self.spec_stats["num_accepted"] += sum(len(t) - 1 for t in token_ids)
-            self.spec_stats["num_rejected"] += sum(len(t) - 1 < m for m, t in zip(num_drafts, token_ids))
-            self.spec_stats["num_emitted"] += num_appended
+            self.spec_stats["num_accepted"] += sum(len(t) - 1 for _, t in decode)
+            self.spec_stats["num_rejected"] += sum(len(t) - 1 < m for (_, t), m in zip(decode, num_drafts))
+            self.spec_stats["num_emitted"] += num_emitted
             self.spec_stats["k_steps"][k] = self.spec_stats["k_steps"].get(k, 0) + 1
         for seq in seqs:
             if seq.is_finished and self.proposer:
                 self.proposer.free(seq)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        # positive: prefill tokens processed; negative: decode tokens produced
-        num_tokens = num_prefill_tokens if is_prefill else -num_appended
+        # positive: prefill tokens processed; negative: decode tokens produced (steps with decode requests)
+        num_tokens = -num_emitted if decode else num_prefill_tokens
         return outputs, num_tokens
 
     def is_finished(self):

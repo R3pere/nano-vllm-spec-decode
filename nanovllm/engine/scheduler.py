@@ -15,9 +15,14 @@ class Scheduler:
         self.block_size = config.kvcache_block_size
         # speculative decoding: each decode step checks up to k guessed tokens, so reserve KV room for 1+k tokens
         self.num_spec_tokens = config.num_speculative_tokens if config.speculative_method else 0
+        self.spec_k_choices = config.spec_k_choices if config.speculative_method else [0]
+        # mixed batching: picks k for the decode requests of a step and makes the n-gram guesses, given the most k
+        # the step can afford (set by LLMEngine; None = never guess)
+        self.choose_num_spec_tokens = None
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.num_preemptions = 0
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -79,18 +84,87 @@ class Scheduler:
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
+    def schedule_mixed(self) -> tuple[list[Sequence], int]:
+        """enable_mixed_batching: one step holds decode requests and prefill chunks together (like vLLM V1).
+        Returns (seqs, k): the decode requests first (seq.is_prefill False, 1+k tokens each: the last token and k
+        guess slots), then the prefill chunks (seq.is_prefill True, seq.num_scheduled_tokens tokens each).
+          1. Every running request decodes, 1 token each so far; KV blocks for it are taken now, preempting the
+             newest running requests if they run out (as in schedule).
+          2. k is chosen now, before anything else gets budget or blocks, and only among the k values whose
+             1+k tokens per request fit in both the token budget and the free KV blocks. So guessing never
+             causes a preemption, and blocks are reserved for the k actually used, not for the largest k.
+          3. What is left of max_num_batched_tokens goes to waiting requests in arrival order, any of which may
+             be cut into chunks. New requests only get blocks that are free: never preempt a decoding request
+             to start a new one. No new requests on a step that just preempted (the blocks are short)."""
+        budget = self.max_num_batched_tokens
+        decode_seqs = []
+        preempted = False
+        while self.running and len(decode_seqs) < min(self.max_num_seqs, budget):
+            seq = self.running.popleft()
+            while not self.block_manager.can_append(seq, 1):
+                preempted = True
+                if self.running:
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(seq)
+                    break
+            else:
+                self.block_manager.may_append(seq, 1)
+                decode_seqs.append(seq)
+        k = 0
+        if decode_seqs and self.choose_num_spec_tokens is not None:
+            k = self.choose_num_spec_tokens(decode_seqs, self.max_affordable_k(decode_seqs, budget))
+        for seq in decode_seqs:
+            self.block_manager.may_append(seq, 1 + k)
+            seq.num_scheduled_tokens = 1 + k
+            seq.is_prefill = False
+        budget -= len(decode_seqs) * (1 + k)
+        self.running.extendleft(reversed(decode_seqs))
+
+        prefill_seqs = []
+        while not preempted and self.waiting and budget > 0 and len(decode_seqs) + len(prefill_seqs) < self.max_num_seqs:
+            seq = self.waiting[0]
+            if not seq.block_table:
+                num_cached_blocks = self.block_manager.can_allocate(seq)
+                if num_cached_blocks == -1:
+                    break
+                self.block_manager.allocate(seq, num_cached_blocks)
+            seq.num_scheduled_tokens = min(seq.num_tokens - seq.num_cached_tokens, budget)
+            budget -= seq.num_scheduled_tokens
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                seq.status = SequenceStatus.RUNNING
+                self.waiting.popleft()
+                self.running.append(seq)
+            prefill_seqs.append(seq)
+        return decode_seqs + prefill_seqs, k
+
+    def max_affordable_k(self, seqs: list[Sequence], budget: int) -> int:
+        """Largest k a step may use for these decode requests (each already holds blocks for 1 token): 1+k tokens
+        each must fit in the token budget and the extra KV blocks in the free ones."""
+        for k in sorted(self.spec_k_choices, reverse=True):
+            if k == 0:
+                break
+            if len(seqs) * (1 + k) <= budget and sum(self.block_manager.num_blocks_to_append(seq, 1 + k) for seq in seqs) <= len(self.block_manager.free_block_ids):
+                return k
+        return 0
+
     def preempt(self, seq: Sequence):
+        self.num_preemptions += 1
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[list[int]], is_prefill: bool) -> int:
+    def postprocess(self, seqs: list[Sequence], token_ids: list[list[int]]) -> int:
         """token_ids[i] are the new tokens of seqs[i]: one token normally, or with speculative decoding
-        the accepted guesses followed by one token from the model. Returns how many tokens were appended."""
+        the accepted guesses followed by one token from the model; for a prefill chunk that isn't the last
+        one, nothing (ignored). Returns how many tokens were appended.
+        Each request is handled by its own kind: seq.is_prefill is set until the scheduler first runs it as a
+        decode request (in a step that is all prefill or all decode, every request has the step's kind)."""
         num_appended_total = 0
         for seq, new_token_ids in zip(seqs, token_ids):
             seq.draft_token_ids = []
+            is_prefill = seq.is_prefill
             if is_prefill:
                 self.block_manager.hash_blocks(seq)
                 seq.num_cached_tokens += seq.num_scheduled_tokens

@@ -337,18 +337,18 @@ def test_engine_choose_k():
 BS = 4    # tiny blocks so crossing block boundaries is easy
 
 
-def make_scheduler(num_blocks=32, k=3, eos=99, max_model_len=1000):
+def make_scheduler(num_blocks=32, k=3, eos=99, max_model_len=1000, max_num_batched_tokens=64, k_choices=None):
     Sequence.block_size = BS
-    config = SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=64, eos=eos, max_model_len=max_model_len, kvcache_block_size=BS,
-                             num_kvcache_blocks=num_blocks, speculative_method="ngram" if k else None,
-                             num_speculative_tokens=k)
+    config = SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=max_num_batched_tokens, eos=eos, max_model_len=max_model_len,
+                             kvcache_block_size=BS, num_kvcache_blocks=num_blocks, speculative_method="ngram" if k else None,
+                             num_speculative_tokens=k, spec_k_choices=k_choices or [k])
     return Scheduler(config)
 
 
 def check_blocks(sched: Scheduler):
     bm = sched.block_manager
     refs = {}
-    for seq in sched.running:
+    for seq in list(sched.running) + list(sched.waiting):    # waiting: a partly prefilled request holds blocks
         for b in seq.block_table:
             refs[b] = refs.get(b, 0) + 1
     for b, r in refs.items():
@@ -395,7 +395,7 @@ def prefill(sched, prompt, max_tokens=50, ignore_eos=False, first_token=50):
     sched.add(seq)
     seqs, is_prefill = sched.schedule()
     assert is_prefill and seqs == [seq]
-    sched.postprocess(seqs, [[first_token]], True)
+    sched.postprocess(seqs, [[first_token]])
     check_blocks(sched)
     return seq
 
@@ -406,7 +406,7 @@ def decode(sched, seq, drafts, new_tokens):
     # the scheduler must have reserved KV room for the last token plus k guesses
     assert len(seq.block_table) * BS >= len(seq) - 1 + 1 + sched.num_spec_tokens
     seq.draft_token_ids = drafts
-    n = sched.postprocess([seq], [new_tokens], False)
+    n = sched.postprocess([seq], [new_tokens])
     check_blocks(sched)
     return n
 
@@ -478,10 +478,128 @@ def test_preemption_with_reservation():
     for _ in range(8):
         seqs, is_prefill = sched.schedule()
         preempted |= any(s.status == SequenceStatus.WAITING and not s.block_table for s in (a, b))
-        sched.postprocess(seqs, [[seq.last_token + 1] for seq in seqs], is_prefill)
+        sched.postprocess(seqs, [[seq.last_token + 1] for seq in seqs])
         check_blocks(sched)
     assert preempted
     print("preemption ok")
+
+
+# ---------------------------------------------------------------- mixed batching
+
+def mixed_step(sched, tokens_of=lambda seq: [seq.last_token + 1]):
+    """One schedule_mixed + postprocess. A decode request gets tokens_of(seq), a prefill chunk gets a token only
+    if it is the request's last chunk (as ModelRunner.run_mixed returns them). Returns what was scheduled."""
+    seqs, k = sched.schedule_mixed()
+    plan = [(seq, seq.is_prefill, seq.num_scheduled_tokens) for seq in seqs]
+    token_ids = []
+    for seq in seqs:
+        if not seq.is_prefill:
+            token_ids.append(tokens_of(seq))
+        else:
+            token_ids.append([77] if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens else [])
+    sched.postprocess(seqs, token_ids)
+    check_blocks(sched)
+    return plan, k
+
+
+def test_mixed_schedule():
+    """Decode first, then the rest of the token budget to prefill chunks, any request may be chunked; a prefill
+    chunk that isn't the last appends nothing."""
+    sched = make_scheduler(k=0, max_num_batched_tokens=8)
+    a = prefill(sched, [1, 2, 3])
+    b = prefill(sched, [4, 5, 6])
+    c = Sequence(list(range(10, 20)), SamplingParams(temperature=0, max_tokens=50))    # 10 prompt tokens
+    d = Sequence(list(range(20, 30)), SamplingParams(temperature=0, max_tokens=50))
+    sched.add(c)
+    sched.add(d)
+    # budget 8: a, b decode (1 each), c gets 6 of its 10 tokens and stays waiting
+    plan, k = mixed_step(sched)
+    assert k == 0 and plan == [(a, False, 1), (b, False, 1), (c, True, 6)], plan
+    assert c.num_cached_tokens == 6 and c.num_tokens == 10 and c in sched.waiting
+    assert a.num_tokens == 5 and b.num_tokens == 5
+    # c's last 4 tokens finish its prefill (first token appended); d is chunked too, not only the first request
+    plan, k = mixed_step(sched)
+    assert plan == [(a, False, 1), (b, False, 1), (c, True, 4), (d, True, 2)], plan
+    assert c.num_tokens == 11 and c.completion_token_ids == [77] and c.num_cached_tokens == 10 and c in sched.running
+    assert d.num_cached_tokens == 2 and not d.completion_token_ids
+    # c now decodes with the others
+    plan, k = mixed_step(sched)
+    assert plan == [(a, False, 1), (b, False, 1), (c, False, 1), (d, True, 5)], plan
+    assert c.num_tokens == 12 and d.num_cached_tokens == 7
+    print("mixed schedule ok")
+
+
+def test_mixed_no_preempt_for_new():
+    """A new request only gets free blocks: decoding requests are never preempted to start one."""
+    sched = make_scheduler(num_blocks=4, k=0)
+    a = prefill(sched, [1, 2, 3, 4, 5])    # 6 tokens, 2 blocks
+    b = Sequence(list(range(10, 22)), SamplingParams(temperature=0))    # needs 3 blocks, only 2 free
+    sched.add(b)
+    for _ in range(3):
+        plan, _ = mixed_step(sched)
+        assert plan == [(a, False, 1)], plan
+    assert b.status == SequenceStatus.WAITING and not b.block_table and sched.num_preemptions == 0
+    print("mixed no preempt for new ok")
+
+
+def test_mixed_choose_k():
+    """k is chosen while scheduling, among the k values the step can afford, and blocks are reserved for it only."""
+    asked = []
+
+    def choose(seqs, max_k):
+        asked.append(max_k)
+        for seq in seqs:
+            seq.draft_token_ids = [1] * max_k
+        return max_k
+
+    # tokens: 2 requests x (1+8) = 18 > budget 16, so k = 8 is out and 4 is the most
+    sched = make_scheduler(k=8, k_choices=[0, 2, 4, 8], max_num_batched_tokens=16)
+    sched.choose_num_spec_tokens = choose
+    a = prefill(sched, [1, 2, 3])
+    b = prefill(sched, [4, 5, 6])
+    seqs, k = sched.schedule_mixed()
+    assert asked == [4] and k == 4 and all(seq.num_scheduled_tokens == 5 for seq in seqs)
+    # positions 3 .. 7 are written: 2 blocks each, not the 3 that k = 8 would need
+    assert all(len(seq.block_table) == 2 for seq in (a, b))
+    sched.postprocess(seqs, [[9], [9]])
+    check_blocks(sched)
+
+    # blocks: 1 request of 6 tokens holding 2 blocks, 1 more free. k = 8 (positions 5..13) needs 2 more, k = 4 one
+    sched = make_scheduler(num_blocks=3, k=8, k_choices=[0, 2, 4, 8])
+    sched.choose_num_spec_tokens = choose
+    asked.clear()
+    a = prefill(sched, [1, 2, 3, 4, 5])
+    seqs, k = sched.schedule_mixed()
+    assert asked == [4] and k == 4 and len(a.block_table) == 3 and sched.num_preemptions == 0
+    sched.postprocess(seqs, [[9]])
+    check_blocks(sched)
+    # no free block left: guessing can't be afforded near the end, but the request still decodes, not preempted
+    while len(a.block_table) * BS > len(a):    # decode until the last block is full
+        seqs, k = sched.schedule_mixed()
+        sched.postprocess(seqs, [[9]])
+        check_blocks(sched)
+    assert asked[-1] == 0 and sched.num_preemptions == 0
+    print("mixed choose k ok")
+
+
+def test_mixed_batch():
+    """mixed_batch: token order, positions, slots, cu_seqlens and which rows get logits."""
+    from nanovllm.engine.model_runner import mixed_batch
+    Sequence.block_size = BS
+    dec = Sequence([1, 2, 3, 4, 5, 6])    # 6 tokens, decoding with 1 guess, k = 2 (padded)
+    dec.is_prefill, dec.num_cached_tokens, dec.block_table, dec.draft_token_ids = False, 5, [7, 3], [9]
+    first = Sequence(list(range(10, 20)))    # first chunk of 6 of 10 tokens
+    first.num_scheduled_tokens, first.block_table = 6, [0, 1, 2]
+    last = Sequence(list(range(20, 25)))    # last chunk: token 4 of 5, after a prefix of 4
+    last.num_cached_tokens, last.num_scheduled_tokens, last.block_table = 4, 1, [4, 5]
+    b = mixed_batch([dec, first, last], 2, BS)
+    assert b["input_ids"] == [6, 9, 9] + list(range(10, 16)) + [24]
+    assert b["positions"] == [5, 6, 7] + list(range(6)) + [4]
+    assert b["slot_mapping"] == [3 * BS + 1, 3 * BS + 2, 3 * BS + 3] + [0, 1, 2, 3, 4, 5] + [5 * BS]
+    assert b["cu_seqlens_q"] == [0, 3, 9, 10] and b["cu_seqlens_k"] == [0, 8, 14, 19]
+    assert b["max_seqlen_q"] == 6 and b["max_seqlen_k"] == 8
+    assert b["logits_indices"] == [0, 1, 2, 9]    # decode: all 3 rows; first chunk: none; last chunk: its last row
+    print("mixed batch ok")
 
 
 if __name__ == "__main__":
@@ -496,4 +614,8 @@ if __name__ == "__main__":
     test_scheduler()
     test_prefix_cache_after_spec()
     test_preemption_with_reservation()
+    test_mixed_schedule()
+    test_mixed_no_preempt_for_new()
+    test_mixed_choose_k()
+    test_mixed_batch()
     print("PASS")

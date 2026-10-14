@@ -1,4 +1,5 @@
 import os
+import sys
 from dataclasses import dataclass
 from transformers import AutoConfig
 
@@ -24,6 +25,7 @@ class Config:
     draft_hf_config: AutoConfig | None = None
     spec_dynamic_k: bool = False             # choose k each step from the acceptance rate (num_speculative_tokens is the most)
     spec_max_batch_size: int = 0             # guess only when at most this many requests decode together; 0 = 512 // (1+k)
+    enable_mixed_batching: bool = False      # one step runs decode requests and prefill chunks together (see Scheduler.schedule_mixed)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -46,6 +48,13 @@ class Config:
             assert self.draft_hf_config.vocab_size == self.hf_config.vocab_size
             assert getattr(self.draft_hf_config, "eos_token_id", None) == getattr(self.hf_config, "eos_token_id", None)
             self.max_model_len = min(self.max_model_len, self.draft_hf_config.max_position_embeddings)
+            if self.enable_mixed_batching:
+                # not supported yet: in a mixed step the draft model would have to write KV for the prefill chunks
+                # and guess for the decode requests at once. Fall back to steps that are all prefill or all decode.
+                print("nanovllm: enable_mixed_batching is not supported with a draft model, turned off", file=sys.stderr)
+                self.enable_mixed_batching = False
+        if self.enable_mixed_batching:
+            assert self.tensor_parallel_size == 1    # not tested with TP > 1
 
     @property
     def spec_k_choices(self) -> list[int]:
