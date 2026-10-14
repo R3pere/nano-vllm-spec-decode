@@ -161,10 +161,20 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q, k, v, residual = self.pre_attn(positions, hidden_states, residual)
-        o = self.self_attn.attn(q, k, v)
-        return self.post_attn(o, residual)
+        # Same ops as pre_attn + attention + post_attn, but written out (as upstream) so every temporary is freed as
+        # early as upstream frees it: q/k/v and the attention output inside self_attn(...), the attention block's
+        # output and the old residual before the MLP. Keeping them alive through the MLP raised the warmup's memory
+        # peak (16384 tokens) by ~300MB, which cost 11 of 99 KV blocks.
+        if residual is None:
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
 
+    # The layer split at its attention, for piecewise CUDA graphs (see ModelRunner.run_segment)
     def pre_attn(
         self,
         positions: torch.Tensor,

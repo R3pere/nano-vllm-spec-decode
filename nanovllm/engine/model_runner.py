@@ -81,6 +81,9 @@ class ModelRunner:
             load_model(self.draft_model, config.draft_model)
         self.models = {"target": self.model, "draft": self.draft_model}
         self.sampler = Sampler()
+        # widest block table a decode step can need: checking guesses writes up to k positions past max_model_len
+        k = config.num_speculative_tokens if config.speculative_method else 0
+        self.max_num_blocks = (config.max_model_len + k + self.block_size - 1) // self.block_size
         self.graph_bs = self.make_graph_bs()
         self.mixed_buckets = self.make_mixed_buckets()
         self.warmup_model()
@@ -255,8 +258,8 @@ class ModelRunner:
                     layer_id += 1
             self.kv_caches[which] = kv_cache
 
-    def prepare_block_tables(self, seqs: list[Sequence], num_padding_seqs: int = 0):
-        max_len = max(len(seq.block_table) for seq in seqs)
+    def prepare_block_tables(self, seqs: list[Sequence], num_padding_seqs: int = 0, width: int = 0):
+        max_len = max([width] + [len(seq.block_table) for seq in seqs])
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables += [[-1] * max_len] * num_padding_seqs
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -341,7 +344,10 @@ class ModelRunner:
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs, num_padding)
+        # Also as wide as the CUDA graphs' block tables: with few sequences flash-attn splits each one's KV into
+        # chunks computed in parallel, and the number of chunks follows from the table's width, so a narrower
+        # table in eager would add the chunks up differently (seen as one flipped bf16 near-tie, P4b)
+        block_tables = self.prepare_block_tables(seqs, num_padding, self.max_num_blocks)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
@@ -629,16 +635,14 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
-        k = config.num_speculative_tokens if config.speculative_method else 0
         families = [(which, n, bs) for which, by_n in self.graph_bs.items() for n, sizes in by_n.items() for bs in sizes]
         max_num_tokens = max(n * bs for _, n, bs in families)
         max_num_seqs = max(bs for _, _, bs in families)
-        max_num_blocks = (config.max_model_len + k + self.block_size - 1) // self.block_size    # checking guesses writes up to k positions past the end
         input_ids = torch.zeros(max_num_tokens, dtype=torch.int64)
         positions = torch.zeros(max_num_tokens, dtype=torch.int64)
         slot_mapping = torch.zeros(max_num_tokens, dtype=torch.int32)
         context_lens = torch.zeros(max_num_seqs, dtype=torch.int32)
-        block_tables = torch.zeros(max_num_seqs, max_num_blocks, dtype=torch.int32)
+        block_tables = torch.zeros(max_num_seqs, self.max_num_blocks, dtype=torch.int32)
         outputs = {}
         for which, cfg in (("target", config.hf_config), ("draft", config.draft_hf_config)):
             if self.graph_bs[which]:
