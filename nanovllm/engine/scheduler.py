@@ -93,9 +93,14 @@ class Scheduler:
           2. k is chosen now, before anything else gets budget or blocks, and only among the k values whose
              1+k tokens per request fit in both the token budget and the free KV blocks. So guessing never
              causes a preemption, and blocks are reserved for the k actually used, not for the largest k.
-          3. What is left of max_num_batched_tokens goes to waiting requests in arrival order, any of which may
-             be cut into chunks. New requests only get blocks that are free: never preempt a decoding request
-             to start a new one. No new requests on a step that just preempted (the blocks are short)."""
+          3. What is left of max_num_batched_tokens goes to waiting requests, any of which may be cut into chunks:
+             first those whose prefill is under way (they already hold all their blocks), then new ones in arrival
+             order. New requests only get blocks that are free: never preempt a decoding request to start a new
+             one. No new requests on a step that just preempted (the blocks are short).
+        Preemption, when a decoding request needs a block and none is free, takes the newest request holding blocks:
+        a half-done prefill first (like vLLM V1, where those count as running), then the newest running request.
+        Without step 3's order, a request preempted to the front of waiting could stand forever before a half-done
+        prefill holding the blocks it needs, with nothing scheduled at all (P4a's deadlock, see DEVLOG)."""
         budget = self.max_num_batched_tokens
         decode_seqs = []
         preempted = False
@@ -103,7 +108,10 @@ class Scheduler:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq, 1):
                 preempted = True
-                if self.running:
+                prefilling = [s for s in self.waiting if s.block_table]
+                if prefilling:
+                    self.preempt_prefill(prefilling[-1])
+                elif self.running:
                     self.preempt(self.running.pop())
                 else:
                     self.preempt(seq)
@@ -122,20 +130,26 @@ class Scheduler:
         self.running.extendleft(reversed(decode_seqs))
 
         prefill_seqs = []
-        while not preempted and self.waiting and budget > 0 and len(decode_seqs) + len(prefill_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
+        # half-done prefills first, then new requests (only if nothing was preempted, or everything was: then all
+        # blocks are free again and starting a new request is what keeps the step from being empty)
+        prefilling = [seq for seq in self.waiting if seq.block_table]
+        new = [] if preempted and decode_seqs else [seq for seq in self.waiting if not seq.block_table]
+        for seq in prefilling + new:
+            if budget == 0 or len(decode_seqs) + len(prefill_seqs) == self.max_num_seqs:
+                break
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
-                    break
+                    break    # arrival order: don't let a later, smaller request jump ahead
                 self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(seq.num_tokens - seq.num_cached_tokens, budget)
             budget -= seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
+                self.waiting.remove(seq)
                 self.running.append(seq)
             prefill_seqs.append(seq)
+        assert decode_seqs or prefill_seqs or self.is_finished(), "a request needs more KV blocks than there are"
         return decode_seqs + prefill_seqs, k
 
     def max_affordable_k(self, seqs: list[Sequence], budget: int) -> int:
@@ -154,6 +168,12 @@ class Scheduler:
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
+
+    def preempt_prefill(self, seq: Sequence):
+        """Drop the blocks of a request whose prefill is half done; it keeps its place in waiting and starts over
+        (its finished blocks are hashed, so the prefix cache may still give them back)."""
+        self.num_preemptions += 1
+        self.block_manager.deallocate(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[list[int]]) -> int:
         """token_ids[i] are the new tokens of seqs[i]: one token normally, or with speculative decoding

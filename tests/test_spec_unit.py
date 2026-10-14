@@ -366,7 +366,12 @@ def check_blocks(sched: Scheduler):
             if block.hash != -1:
                 assert (i + 1) * BS <= seq.num_cached_tokens, (i, seq.num_cached_tokens)
                 assert block.token_ids == seq.block(i)
-                assert bm.hash_to_block_id[block.hash] == b
+                # two requests that computed the same text separately (neither hit the cache) both hash their
+                # block; the cache keeps the newer one, which must hold the same text (and if that one is
+                # reused for something else, the hash leaves the cache and this block is just not findable)
+                if block.hash in bm.hash_to_block_id:
+                    other = bm.blocks[bm.hash_to_block_id[block.hash]]
+                    assert other.block_id == b or other.token_ids == block.token_ids, (b, other.block_id)
 
 
 def test_block_reservation():
@@ -490,6 +495,8 @@ def mixed_step(sched, tokens_of=lambda seq: [seq.last_token + 1]):
     """One schedule_mixed + postprocess. A decode request gets tokens_of(seq), a prefill chunk gets a token only
     if it is the request's last chunk (as ModelRunner.run_mixed returns them). Returns what was scheduled."""
     seqs, k = sched.schedule_mixed()
+    # while there is work left, a step must schedule something (an empty step would repeat forever)
+    assert seqs or sched.is_finished(), [(s.seq_id, len(s.block_table)) for s in sched.waiting]
     plan = [(seq, seq.is_prefill, seq.num_scheduled_tokens) for seq in seqs]
     token_ids = []
     for seq in seqs:
@@ -582,6 +589,96 @@ def test_mixed_choose_k():
     print("mixed choose k ok")
 
 
+def test_mixed_preempt_before_half_prefill():
+    """The P4a deadlock: a decoding request that runs out of blocks used to preempt itself and go to the front of
+    waiting, ahead of a request whose prefill was half done and still held its blocks. The prefill loop only looked
+    at waiting[0], which couldn't get blocks, so nothing was scheduled, and the next step was the same."""
+    sched = make_scheduler(num_blocks=10, k=0, max_num_batched_tokens=8)
+    a = Sequence(list(range(1, 16)), SamplingParams(temperature=0, max_tokens=20, ignore_eos=True))    # 15 tokens
+    sched.add(a)
+    mixed_step(sched)
+    mixed_step(sched)    # a's prefill done: 16 tokens, 4 blocks
+    p = Sequence(list(range(20, 44)), SamplingParams(temperature=0, max_tokens=5))    # 24 tokens, 6 blocks
+    sched.add(p)
+    plan, _ = mixed_step(sched)    # a decodes, p takes the last 6 blocks and starts its prefill
+    assert plan == [(a, False, 1), (p, True, 7)], plan
+    assert not sched.block_manager.free_block_ids and p in sched.waiting and p.block_table
+    # a needs a 5th block. The half-done prefill is the one preempted (it is the newer request), a keeps decoding
+    plan, _ = mixed_step(sched)
+    assert plan == [(a, False, 1)], plan
+    assert sched.num_preemptions == 1 and p.status == SequenceStatus.WAITING and not p.block_table
+    assert p.num_cached_tokens == 0 and list(sched.waiting) == [p]
+    while not sched.is_finished():    # and everything finishes
+        mixed_step(sched)
+    assert a.is_finished and p.is_finished and len(sched.block_manager.free_block_ids) == 10
+    print("mixed preempt before half prefill ok")
+
+
+def test_mixed_half_prefill_first():
+    """A request preempted to the front of waiting can't block a half-done prefill behind it: requests that hold
+    blocks continue first, even on a step that preempted, and even if nothing is decoding."""
+    sched = make_scheduler(num_blocks=10, k=0, max_num_batched_tokens=8)
+    a = Sequence(list(range(1, 17)), SamplingParams(temperature=0, max_tokens=5))    # 16 tokens, 4 blocks
+    p = Sequence(list(range(20, 44)), SamplingParams(temperature=0, max_tokens=5))   # 24 tokens, 6 blocks
+    sched.add(p)
+    plan, _ = mixed_step(sched)    # p: first chunk, holds 6 blocks
+    assert plan == [(p, True, 8)] and len(p.block_table) == 6
+    # a lands in front of p without blocks (as a preempted request does); 4 blocks free, a needs 5 after decoding
+    a.append_token(50)    # 17 tokens -> 5 blocks
+    sched.waiting.appendleft(a)
+    plan, _ = mixed_step(sched)
+    assert plan == [(p, True, 8)], plan    # a can't get blocks, p goes on
+    plan, _ = mixed_step(sched)
+    assert plan == [(p, True, 8)], plan    # p's last chunk; a still waits, behind nothing
+    assert p in sched.running
+    while not sched.is_finished():
+        mixed_step(sched)
+    assert a.is_finished and p.is_finished and len(sched.block_manager.free_block_ids) == 10
+    print("mixed half prefill first ok")
+
+
+def test_mixed_random():
+    """Random arrivals, guesses, EOS, shared prefixes and few KV blocks: every step schedules something while work
+    remains, block bookkeeping stays exact, and every request finishes."""
+    rng = np.random.default_rng(0)
+    total_preemptions = 0
+    for trial in range(300):
+        num_blocks = int(rng.integers(4, 16))
+        k_max = int(rng.choice([0, 2, 4]))
+        sched = make_scheduler(num_blocks=num_blocks, k=k_max, k_choices=sorted({0, k_max // 2, k_max}),
+                               max_num_batched_tokens=int(rng.integers(4, 20)), max_model_len=num_blocks * BS)
+
+        def choose(seqs, max_k):
+            k = int(rng.integers(0, max_k + 1))
+            for seq in seqs:
+                seq.draft_token_ids = rng.integers(0, 99, int(rng.integers(0, k + 1))).tolist()
+            return k
+
+        def tokens_of(seq):    # some of the guesses kept, then one token from the model; EOS now and then
+            kept = seq.draft_token_ids[:int(rng.integers(0, len(seq.draft_token_ids) + 1))]
+            return kept + [99 if rng.random() < 0.05 else int(rng.integers(0, 99))]
+
+        sched.choose_num_spec_tokens = choose if k_max else None
+        prefixes = [rng.integers(0, 99, int(rng.integers(1, 12))).tolist() for _ in range(3)]
+        seqs = []
+        for step in range(3000):
+            if len(seqs) < 12 and rng.random() < 0.3:
+                prompt = prefixes[int(rng.integers(0, 3))] + rng.integers(0, 99, int(rng.integers(0, 12))).tolist()
+                prompt = prompt[:num_blocks * BS - 2]
+                seqs.append(Sequence(prompt, SamplingParams(temperature=0, max_tokens=int(rng.integers(1, 30)))))
+                sched.add(seqs[-1])
+            if sched.is_finished():
+                if len(seqs) == 12:
+                    break
+                continue
+            mixed_step(sched, tokens_of)
+        assert len(seqs) == 12 and all(seq.is_finished for seq in seqs), trial
+        assert len(sched.block_manager.free_block_ids) == num_blocks
+        total_preemptions += sched.num_preemptions
+    assert total_preemptions > 100, total_preemptions    # the test did get into tight spots
+    print(f"mixed random ok ({total_preemptions} preemptions)")
+
+
 def test_mixed_batch():
     """mixed_batch: token order, positions, slots, cu_seqlens and which rows get logits."""
     from nanovllm.engine.model_runner import mixed_batch
@@ -617,5 +714,8 @@ if __name__ == "__main__":
     test_mixed_schedule()
     test_mixed_no_preempt_for_new()
     test_mixed_choose_k()
+    test_mixed_preempt_before_half_prefill()
+    test_mixed_half_prefill_first()
+    test_mixed_random()
     test_mixed_batch()
     print("PASS")
