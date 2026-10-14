@@ -37,6 +37,9 @@ bf16 near-ties; they only face the referee.)
 
 A model guessing for itself should have almost every guess accepted (MIN_ACCEPTANCE). A bug in the
 draft model's KV cache doesn't change the output (the big model checks every guess), only this rate.
+The rate checked is accepted / (accepted + rejections), the chance that a tested guess is kept. Not
+accepted / proposed: that one falls as k grows (after one bf16 flip the rest of the step's guesses all
+count as not accepted), e.g. 0.969 at k=4 but 0.942 at k=8 for the same per-guess rate ~0.9875.
 
 Usage: python tests/test_greedy.py [--model PATH] [--max-tokens N] [--tol T] [--variants NAME ...]
 """
@@ -135,8 +138,8 @@ def run_nanovllm(model, prompts, max_tokens, **kwargs):
     acceptance = None
     if llm.spec_method:
         s = llm.get_spec_stats()
-        acceptance = s["acceptance_rate"]
-        print(f"  acceptance rate {s['acceptance_rate']:.3f}, tokens per step {s['tokens_per_step']:.2f}, "
+        acceptance = s["guess_acceptance"]
+        print(f"  acceptance rate {s['acceptance_rate']:.3f} (per tested guess {s['guess_acceptance']:.3f}), tokens per step {s['tokens_per_step']:.2f}, "
               f"steps per k {s['k_steps']}, KV blocks {llm.config.num_kvcache_blocks}", flush=True)
     return {"tokens": [o["token_ids"] for o in outputs], "acceptance": acceptance}
 
@@ -214,7 +217,7 @@ def main(args):
             ok &= same_partner == num_prompts
         if name in MIN_ACCEPTANCE:
             acceptance = runs[name]["acceptance"]
-            note += f"  (acceptance {acceptance:.3f}, must be >= {MIN_ACCEPTANCE[name]})"
+            note += f"  (acceptance per tested guess {acceptance:.3f}, must be >= {MIN_ACCEPTANCE[name]})"
             ok &= acceptance >= MIN_ACCEPTANCE[name]
         all_ok &= ok
         print(f"{name:24s} {len(flat):6d} {not_top1:9d} {worst:9.4f} {same:>6d}/{num_prompts:<6d}  {'OK' if ok else 'FAIL'}{note}")

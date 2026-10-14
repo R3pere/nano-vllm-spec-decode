@@ -50,14 +50,18 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def reset_spec_stats(self):
-        self.spec_stats = dict(num_steps=0, num_drafts=0, num_accepted=0, num_emitted=0, k_steps={})
+        self.spec_stats = dict(num_steps=0, num_drafts=0, num_accepted=0, num_rejected=0, num_emitted=0, k_steps={})
 
     def get_spec_stats(self) -> dict:
         """Speculative decoding counters since the last reset. A "step" here is one decode step of one request.
         acceptance_rate = accepted guesses / proposed guesses; tokens_per_step = tokens produced per decode step
-        (plain decoding is 1.0); k_steps[k] = how many engine steps used k (0 = didn't guess)."""
+        (plain decoding is 1.0); k_steps[k] = how many engine steps used k (0 = didn't guess).
+        guess_acceptance = accepted / (accepted + rejections): the chance that a guess that was actually tested is
+        kept. acceptance_rate falls as k grows even when every guess is equally good (after the first rejection the
+        rest of the step's guesses count as not accepted); guess_acceptance doesn't depend on k."""
         s = dict(self.spec_stats)
         s["acceptance_rate"] = s["num_accepted"] / max(s["num_drafts"], 1)
+        s["guess_acceptance"] = s["num_accepted"] / max(s["num_accepted"] + s["num_rejected"], 1)
         s["tokens_per_step"] = s["num_emitted"] / max(s["num_steps"], 1)
         s["k_steps"] = dict(sorted(s["k_steps"].items()))
         return s
@@ -131,6 +135,7 @@ class LLMEngine:
             self.spec_stats["num_steps"] += len(seqs)
             self.spec_stats["num_drafts"] += sum(num_drafts)
             self.spec_stats["num_accepted"] += sum(len(t) - 1 for t in token_ids)
+            self.spec_stats["num_rejected"] += sum(len(t) - 1 < m for m, t in zip(num_drafts, token_ids))
             self.spec_stats["num_emitted"] += num_appended
             self.spec_stats["k_steps"][k] = self.spec_stats["k_steps"].get(k, 0) + 1
         for seq in seqs:
