@@ -215,8 +215,7 @@ def print_tables(out, sections):
 
 def print_mixed(out):
     for rate in MIXED_RATES:
-        print(f"### mixed batching, {rate} requests/s (ms; throughput in output tok/s)
-")
+        print(f"### mixed batching, {rate} requests/s (ms; throughput in output tok/s)\n")
         rows = []
         for config in MIXED_CONFIGS:
             r = load(out, f"mixed_r{rate}_{config}")
