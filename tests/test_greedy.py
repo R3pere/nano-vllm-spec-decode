@@ -31,15 +31,17 @@ Variants checked:
   mixed_eager    - mixed batching (decode requests and prefill chunks in one step), eager, 256-token
                    budget so that mixed steps really happen (the long prompts are prefilled in chunks
                    while the short ones already decode)
-  mixed_graph    - the same with CUDA Graph (steps that are all decode use the graphs, mixed steps run eagerly)
+  mixed_graph    - the same with CUDA Graph (steps that are all decode use the whole-model graphs, mixed steps
+                   the piecewise graphs: everything but attention recorded per total token count; mixed_eager
+                   pads mixed steps to the same token counts, so both compute the same shapes)
   mixed_spec_ngram_graph, mixed_spec_ngram_dynk_graph - mixed batching with n-gram guessing, k = 4 / dynamic k
 Each runs in its own process so they don't fight over GPU memory.
 
 Pairs that run exactly the same computation, only eager vs CUDA Graph, must give identical
 tokens on every prompt (MUST_MATCH): graph = eager, spec_ngram_graph = spec_ngram,
-spec_draft_graph = spec_draft, mixed_graph = mixed_eager (mixed steps run eagerly in both; steps that
-are all decode use graphs vs eager, which give the same tokens as graph = eager). (Dynamic k picks k from timings, so runs can differ in k and in
-bf16 near-ties; they only face the referee.)
+spec_draft_graph = spec_draft, mixed_graph = mixed_eager (piecewise graphs vs the same segments run
+eagerly). (Dynamic k picks k from timings, so runs can differ in k and in bf16 near-ties; they only face
+the referee.)
 
 A model guessing for itself should have almost every guess accepted (MIN_ACCEPTANCE). A bug in the
 draft model's KV cache doesn't change the output (the big model checks every guess), only this rate.

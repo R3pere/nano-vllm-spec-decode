@@ -28,6 +28,8 @@ rate, up to --k (with dynamic k, use a larger --k such as 8).
 All requests arrive at once unless --rate is given (Poisson arrivals, requests/second).
 --mixed runs decode requests and prefill chunks in the same step (enable_mixed_batching); then
 --max-num-batched-tokens (the token budget per step) decides how big the prefill chunks can get.
+Mixed steps use piecewise CUDA graphs unless --no-mixed-graph (P4a: eager). The result also has the mean
+time of a step by kind (all decode / mixed / all prefill), measured around LLMEngine.step.
 
 --concurrency C keeps at most C requests in flight: a new request is sent only when one finishes,
 and its TTFT is counted from when it is sent. Speculative decoding helps most when few requests
@@ -36,7 +38,7 @@ run together, so test several levels.
 Usage: python bench.py [--workload random|copy|chat] [--num-seqs N] [--concurrency C] [--rate R]
                        [--temperature T] [--enforce-eager] [--spec ngram|draft [--k K] [--dynamic-k]
                        [--draft-model PATH] [--spec-proposer random] [--spec-max-batch B]]
-                       [--mixed] [--max-num-batched-tokens N] [--out result.json]
+                       [--mixed [--no-mixed-graph]] [--max-num-batched-tokens N] [--out result.json]
 scripts/bench_matrix.py runs the whole comparison matrix and prints the tables.
 """
 import argparse
@@ -131,6 +133,7 @@ def main():
     p.add_argument("--spec-proposer", choices=["ngram", "random"], default="ngram", help="random = worst case, n-gram guesses replaced by random tokens")
     p.add_argument("--spec-max-batch", type=int, default=0, help="guess only when at most this many requests decode together; 0 = default")
     p.add_argument("--mixed", action="store_true", help="mixed batching: decode requests and prefill chunks in one step")
+    p.add_argument("--no-mixed-graph", action="store_true", help="--mixed: run mixed steps eagerly, unpadded (P4a) instead of piecewise CUDA graphs")
     p.add_argument("--max-num-batched-tokens", type=int, default=16384, help="token budget per step")
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--seed", type=int, default=0)
@@ -141,7 +144,8 @@ def main():
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=args.max_model_len,
               speculative_method=args.spec, num_speculative_tokens=args.k, spec_max_batch_size=args.spec_max_batch,
               spec_dynamic_k=args.dynamic_k, draft_model=draft_model,
-              enable_mixed_batching=args.mixed, max_num_batched_tokens=args.max_num_batched_tokens)
+              enable_mixed_batching=args.mixed, mixed_cuda_graph=not args.no_mixed_graph,
+              max_num_batched_tokens=args.max_num_batched_tokens)
     if args.spec == "ngram" and args.spec_proposer == "random":
         rng = Random(args.seed)
         vocab_size = llm.model_runner.config.hf_config.vocab_size
@@ -177,6 +181,7 @@ def main():
     finish = [None] * n
     token_times = [[] for _ in range(n)]    # when each request received new tokens (one entry per step that brought some)
     num_seen = [0] * n
+    step_times = {"decode": [], "mixed": [], "prefill": []}    # seconds per step, by kind of step
     running = set()
     next_req = 0
     start = time.perf_counter()
@@ -190,8 +195,12 @@ def main():
         if not running:    # idle until the next request arrives
             time.sleep(arrivals[next_req] - now)
             continue
-        llm.step()
+        num_mixed = llm.num_mixed_steps
+        step_start = time.perf_counter()
+        _, num_tokens = llm.step()    # ends by copying the new tokens to the CPU, so the step's GPU work is done
         now = time.perf_counter() - start
+        kind = "mixed" if llm.num_mixed_steps > num_mixed else "decode" if num_tokens < 0 else "prefill"
+        step_times[kind].append(time.perf_counter() - step_start)
         for i in list(running):
             if seqs[i].num_completion_tokens > num_seen[i]:
                 num_seen[i] = seqs[i].num_completion_tokens
@@ -231,7 +240,11 @@ def main():
         "mixed": args.mixed,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "mixed_steps": llm.num_mixed_steps,
+        "mixed_cuda_graph": not args.no_mixed_graph,
         "preemptions": llm.scheduler.num_preemptions,
+        # mean wall time of one step by kind: all decode (incl. checking guesses), mixed, all prefill
+        "step_ms": {kind: 1000 * float(np.mean(ts)) if ts else None for kind, ts in step_times.items()},
+        "num_steps": {kind: len(ts) for kind, ts in step_times.items()},
     }
     if args.spec:
         result["spec_stats"] = llm.get_spec_stats()
@@ -242,6 +255,7 @@ def main():
         s = result[name]
         print(f"{name[:4].upper().rstrip('_')} (ms): mean {s['mean']:.1f}  p50 {s['p50']:.1f}  p99 {s['p99']:.1f}  max {s['max']:.1f}")
     print(f"mixed steps: {result['mixed_steps']}  preemptions: {result['preemptions']}")
+    print("ms per step: " + "  ".join(f"{kind} {ms:.1f} ({result['num_steps'][kind]} steps)" for kind, ms in result["step_ms"].items() if ms is not None))
     if args.spec:
         s = result["spec_stats"]
         print(f"speculative: acceptance rate {s['acceptance_rate']:.3f}  tokens per step {s['tokens_per_step']:.2f}  steps per k {s['k_steps']}")

@@ -82,8 +82,11 @@ class ModelRunner:
         self.models = {"target": self.model, "draft": self.draft_model}
         self.sampler = Sampler()
         self.graph_bs = self.make_graph_bs()
+        self.mixed_buckets = self.make_mixed_buckets()
         self.warmup_model()
         self.allocate_kv_cache()
+        if self.mixed_buckets:
+            self.piecewise_vars = self.make_piecewise_vars()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -120,6 +123,33 @@ class ModelRunner:
                 graph_bs["draft"][1] = sizes[:next(i for i, x in enumerate(sizes) if x >= most) + 1]
         return graph_bs
 
+    def make_mixed_buckets(self) -> list[int]:
+        """Total token counts mixed steps are padded to, each with its piecewise CUDA graphs (see run_piecewise):
+        every 64 up to max_num_batched_tokens, at most 512; bigger mixed steps run eagerly, unpadded. Known even
+        with enforce_eager, which pads the same way so that eager and graphs give the same tokens. Empty without
+        mixed batching or with mixed_cuda_graph off (P4a: mixed steps eager, unpadded)."""
+        config = self.config
+        if not (config.enable_mixed_batching and config.mixed_cuda_graph):
+            return []
+        most = min(config.max_num_batched_tokens, 512)
+        return list(range(64, most, 64)) + [most]
+
+    def make_piecewise_vars(self) -> dict[str, torch.Tensor]:
+        """Fixed buffers the piecewise graphs read and write, sized for the biggest bucket and used as [:n]."""
+        n = self.mixed_buckets[-1]
+        attn = self.model.model.layers[0].self_attn
+        hidden_size = self.config.hf_config.hidden_size
+        return dict(
+            input_ids=torch.zeros(n, dtype=torch.int64),
+            positions=torch.zeros(n, dtype=torch.int64),
+            q=torch.zeros(n, attn.num_heads, attn.head_dim),
+            k=torch.zeros(n, attn.num_kv_heads, attn.head_dim),
+            v=torch.zeros(n, attn.num_kv_heads, attn.head_dim),
+            o=torch.zeros(n, attn.num_heads, attn.head_dim),    # attention output
+            residual=torch.zeros(n, hidden_size),
+            hidden=torch.zeros(n, hidden_size),                 # final output (after the last norm)
+        )
+
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
@@ -127,7 +157,7 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            del self.graphs, self.piecewise_graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -465,7 +495,10 @@ class ModelRunner:
         order = seqs
         seqs = decode_seqs + prefill_seqs    # decode rows come first in the logits
         input_ids, positions = self.prepare_mixed(seqs, k)
-        hidden_states = self.run_model(input_ids, positions, True)
+        if self.mixed_buckets and input_ids.size(0) <= self.mixed_buckets[-1]:
+            hidden_states = self.run_piecewise(input_ids, positions)
+        else:
+            hidden_states = self.run_model(input_ids, positions, True)
         logits = self.model.compute_logits(hidden_states)
         reset_context()
         D = len(decode_seqs)
@@ -489,7 +522,57 @@ class ModelRunner:
             tokens_of[id(seq)] = [next(first_tokens)] if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens else []
         return [tokens_of[id(seq)] for seq in order]
 
-    def measure_step_costs(self, context_len: int = 512, repeat: int = 3) -> tuple[dict[int, list[float]], dict[int, list[int]]]:
+    def run_segment(self, i: int, n: int):
+        """Segment i of the model for n tokens, on the buffers of make_piecewise_vars. With L layers there are L+1
+        segments, split at the attentions: segment 0 = embedding + layer 0 up to its attention; segment i =
+        the rest of layer i-1 after its attention + layer i up to its attention; segment L = the rest of the last
+        layer + the final norm. Each reads input_ids / positions / o / residual and writes q / k / v / residual (or
+        hidden). Nothing here reads get_context(): every token is computed on its own, so a segment only depends
+        on n, and one recording serves every mixed step padded to n."""
+        m, pv = self.model.model, self.piecewise_vars
+        if i == 0:
+            hidden_states, residual = m.embed_tokens(pv["input_ids"][:n]), None
+        else:
+            hidden_states, residual = m.layers[i - 1].post_attn(pv["o"][:n], pv["residual"][:n])
+        if i == len(m.layers):
+            pv["hidden"][:n] = m.norm(hidden_states, residual)[0]
+            return
+        q, k, v, residual = m.layers[i].pre_attn(pv["positions"][:n], hidden_states, residual)
+        pv["q"][:n] = q
+        pv["k"][:n] = k
+        pv["v"][:n] = v
+        pv["residual"][:n] = residual
+
+    @torch.inference_mode()
+    def run_piecewise(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """The big model on a mixed step (context set by prepare_mixed): the segments between attentions replay
+        CUDA graphs recorded per total token count (eager: run the same code, same padded shapes), the attentions
+        run eagerly in between on the real tokens only. Graph replays save the kernel launch overhead of
+        everything but attention, which is most of the time of a small step.
+        Padding: the step's n tokens are padded to the next bucket with token 0 at position 0. Padded rows never
+        enter attention (it gets [:n]: no KV written, not in cu_seqlens), and their attention output is zero.
+        Their other outputs are garbage that no real row reads (every op outside attention is per token), and
+        logits_indices never points at them. Returns the hidden states of the n real tokens (a buffer the next
+        step overwrites)."""
+        n = input_ids.size(0)
+        bucket = next(x for x in self.mixed_buckets if x >= n)
+        pv = self.piecewise_vars
+        pv["input_ids"][:n] = input_ids
+        pv["input_ids"][n:bucket] = 0
+        pv["positions"][:n] = positions
+        pv["positions"][n:bucket] = 0
+        pv["o"][n:bucket] = 0
+        layers = self.model.model.layers
+        for i in range(len(layers) + 1):
+            if i:
+                pv["o"][:n] = layers[i - 1].self_attn.attn(pv["q"][:n], pv["k"][:n], pv["v"][:n])
+            if self.enforce_eager:
+                self.run_segment(i, bucket)
+            else:
+                self.piecewise_graphs[(bucket, i)].replay()
+        return pv["hidden"][:n]
+
+    def measure_step_costs(self,context_len: int = 512, repeat: int = 3) -> tuple[dict[int, list[float]], dict[int, list[int]]]:
         """For dynamic k: time one decode step (ModelRunner.run, which includes drafting with a draft model) for
         every k a step may use and every batch-size bucket. Returns (costs, buckets): costs[k][i] is milliseconds
         at batch size buckets[k][i]. Made-up requests of context_len tokens; their KV blocks are real (nothing
@@ -576,6 +659,18 @@ class ModelRunner:
             self.graphs[(which, n, bs)] = graph
             torch.cuda.synchronize()
             reset_context()
+
+        # piecewise graphs for mixed steps (see run_piecewise), in the same memory pool. No context is set while
+        # recording: a segment that read it would fail here instead of silently recording one step's batch layout.
+        self.piecewise_graphs = {}
+        for n in reversed(self.mixed_buckets):
+            for i in range(len(self.model.model.layers) + 1):
+                self.run_segment(i, n)    # warmup
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, self.graph_pool):
+                    self.run_segment(i, n)
+                self.piecewise_graphs[(n, i)] = graph
+            torch.cuda.synchronize()
 
         self.graph_vars = dict(
             input_ids=input_ids,

@@ -26,6 +26,8 @@ class Config:
     spec_dynamic_k: bool = False             # choose k each step from the acceptance rate (num_speculative_tokens is the most)
     spec_max_batch_size: int = 0             # guess only when at most this many requests decode together; 0 = 512 // (1+k)
     enable_mixed_batching: bool = False      # one step runs decode requests and prefill chunks together (see Scheduler.schedule_mixed)
+    mixed_cuda_graph: bool = True            # mixed batching: mixed steps use piecewise CUDA graphs (ModelRunner.run_piecewise);
+                                             # with enforce_eager they run the same padded shapes eagerly. False = P4a (eager, unpadded)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

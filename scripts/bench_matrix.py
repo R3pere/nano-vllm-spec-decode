@@ -17,10 +17,13 @@ Sections:
   mixed   mixed batching under requests that keep arriving (Poisson): long prompts (1-2K tokens) and long
           outputs (256-512), so new prefills keep interrupting decoding. Upstream scheduling (CUDA graph)
           against mixed batching with token budgets 256/512/1024/2048 (steps that are all decode use the CUDA
-          graphs, mixed steps run eagerly), mixed batching fully eager at 512, and both with n-gram dynamic k.
-          Reports ITL (P50 / P99 / longest stall), TTFT and throughput.
+          graphs, mixed steps of up to 512 tokens the piecewise graphs, bigger ones run eagerly), mixed batching
+          at 512 with mixed steps eager as in P4a (mixed512_p4a), fully eager at 512, and upstream / mixed512
+          with n-gram dynamic k. Reports ITL (P50 / P99 / longest stall), TTFT, throughput and the mean time of
+          a decode step and of a mixed step.
 
 Usage: MODEL=/path/to/Qwen3-0.6B python scripts/bench_matrix.py [--out results/matrix] [--sections ...] [--table-only]
+                                                                [--only CONFIG ...]
 """
 import argparse
 import json
@@ -48,6 +51,7 @@ MIXED_ARGS = ["--workload", "random", "--input-len", "1024", "2048", "--output-l
 MIXED_CONFIGS = {
     "graph": [],
     **{f"mixed{b}": ["--mixed", "--max-num-batched-tokens", str(b)] for b in MIXED_BUDGETS},
+    "mixed512_p4a": ["--mixed", "--max-num-batched-tokens", "512", "--no-mixed-graph"],
     "mixed512_eager": ["--mixed", "--max-num-batched-tokens", "512", "--enforce-eager"],
     "spec_dynk": ["--spec", "ngram", "--k", "8", "--dynamic-k"],
     "mixed512_spec_dynk": ["--mixed", "--max-num-batched-tokens", "512", "--spec", "ngram", "--k", "8", "--dynamic-k"],
@@ -220,14 +224,16 @@ def print_mixed(out):
         for config in MIXED_CONFIGS:
             r = load(out, f"mixed_r{rate}_{config}")
             if not r:
-                rows.append([config] + ["-"] * 9)
+                rows.append([config] + ["-"] * 11)
                 continue
             itl, ttft = r["itl_ms"], r["ttft_ms"]
+            step_ms = r.get("step_ms", {})    # results from before P4b don't have it
+            ms = lambda kind: f"{step_ms[kind]:.1f}" if step_ms.get(kind) is not None else "-"
             rows.append([config, f"{itl['p50']:.1f}", f"{itl['p99']:.1f}", f"{itl['max']:.0f}", f"{ttft['p50']:.0f}",
                          f"{ttft['p99']:.0f}", f"{r['tpot_ms']['mean']:.1f}", f"{r['output_throughput']:.0f}",
-                         str(r.get("mixed_steps", 0)), str(r.get("preemptions", 0))])
+                         ms("decode"), ms("mixed"), str(r.get("mixed_steps", 0)), str(r.get("preemptions", 0))])
         table(["config", "ITL P50", "ITL P99", "ITL max", "TTFT P50", "TTFT P99", "TPOT mean", "throughput",
-               "mixed steps", "preemptions"], rows)
+               "decode step", "mixed step", "mixed steps", "preemptions"], rows)
 
 
 def k_hist(r):
@@ -244,9 +250,13 @@ def main():
     p.add_argument("--out", default=os.path.join(ROOT, "results", "matrix"))
     p.add_argument("--sections", nargs="+", choices=SECTIONS, default=SECTIONS)
     p.add_argument("--table-only", action="store_true")
+    p.add_argument("--only", nargs="+", metavar="CONFIG", help="run only the runs whose name ends with _CONFIG (tables show all)")
     args = p.parse_args()
     if not args.table_only:
-        run_all(plan(args.sections), args.out)
+        runs = plan(args.sections)
+        if args.only:
+            runs = [r for r in runs if any(r[0].endswith(f"_{c}") for c in args.only)]
+        run_all(runs, args.out)
     print_tables(args.out, args.sections)
 
 
