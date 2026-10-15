@@ -24,8 +24,9 @@ Variants checked:
   spec_ngram     - nano-vllm eager with n-gram speculative decoding (k=4)
   spec_ngram_graph - the same with CUDA Graph (checking guesses also runs as a graph)
   spec_ngram_graph_chunked - the same with the 512-token budget
-  spec_draft     - nano-vllm eager, a draft model guesses (k=4); the model guesses for itself here
-                   (two copies of the same model: 1.7B + 0.6B don't fit in 6GB)
+  spec_draft     - nano-vllm eager, a draft model guesses (k=4); by default the model guesses for itself
+                   (two copies of the same model: 1.7B + 0.6B don't fit in 6GB), --draft-model PATH uses
+                   a separate small model (e.g. Qwen3-0.6B guessing for Qwen3-8B)
   spec_draft_graph, spec_draft_graph_chunked - the same with CUDA Graph / with the 512-token budget
   spec_ngram_dynk_graph, spec_draft_dynk_graph - CUDA Graph, k chosen every step (at most 8)
   mixed_eager    - mixed batching (decode requests and prefill chunks in one step), eager, 256-token
@@ -45,11 +46,13 @@ the referee.)
 
 A model guessing for itself should have almost every guess accepted (MIN_ACCEPTANCE). A bug in the
 draft model's KV cache doesn't change the output (the big model checks every guess), only this rate.
+With --draft-model (a different, smaller model) many guesses are rightly rejected, so the rate is only
+reported, not checked; the variants must still pass the referee and MUST_MATCH.
 The rate checked is accepted / (accepted + rejections), the chance that a tested guess is kept. Not
 accepted / proposed: that one falls as k grows (after one bf16 flip the rest of the step's guesses all
 count as not accepted), e.g. 0.969 at k=4 but 0.942 at k=8 for the same per-guess rate ~0.9875.
 
-Usage: python tests/test_greedy.py [--model PATH] [--max-tokens N] [--tol T] [--variants NAME ...]
+Usage: python tests/test_greedy.py [--model PATH] [--draft-model PATH] [--max-tokens N] [--tol T] [--variants NAME ...]
 """
 import argparse
 import json
@@ -69,7 +72,7 @@ VARIANTS = {
     "spec_ngram": dict(enforce_eager=True, speculative_method="ngram", num_speculative_tokens=4),
     "spec_ngram_graph": dict(enforce_eager=False, speculative_method="ngram", num_speculative_tokens=4),
     "spec_ngram_graph_chunked": dict(enforce_eager=False, max_num_batched_tokens=512, speculative_method="ngram", num_speculative_tokens=4),
-    # draft_model=SELF: the model under test guesses for itself
+    # draft_model=SELF: the model under test guesses for itself, or the model given by --draft-model
     "spec_draft": dict(enforce_eager=True, speculative_method="draft", draft_model="SELF", num_speculative_tokens=4),
     "spec_draft_graph": dict(enforce_eager=False, speculative_method="draft", draft_model="SELF", num_speculative_tokens=4),
     "spec_draft_graph_chunked": dict(enforce_eager=False, max_num_batched_tokens=512, speculative_method="draft", draft_model="SELF", num_speculative_tokens=4),
@@ -141,10 +144,10 @@ def run_hf_greedy(model, prompts, max_tokens, eos):
     return outputs
 
 
-def run_nanovllm(model, prompts, max_tokens, **kwargs):
+def run_nanovllm(model, prompts, max_tokens, draft_path=None, **kwargs):
     from nanovllm import LLM, SamplingParams
     if kwargs.get("draft_model") == "SELF":
-        kwargs = dict(kwargs, draft_model=model)
+        kwargs = dict(kwargs, draft_model=draft_path or model)
     llm = LLM(model, **kwargs)
     outputs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=max_tokens), use_tqdm=False)
     acceptance = None
@@ -182,7 +185,7 @@ def worker(args):
     elif args.worker == "hf_bf16":
         result = {"tokens": run_hf_greedy(args.model, prompts, args.max_tokens, eos), "acceptance": None}
     else:
-        result = run_nanovllm(args.model, prompts, args.max_tokens, **VARIANTS[args.worker])
+        result = run_nanovllm(args.model, prompts, args.max_tokens, args.draft_model, **VARIANTS[args.worker])
     with open(args.out, "w") as f:
         json.dump(result, f)
 
@@ -191,6 +194,8 @@ def call_worker(name, out, args, inp=None):
     cmd = [sys.executable, __file__, "--worker", name, "--out", out, "--model", args.model, "--max-tokens", str(args.max_tokens)]
     if inp:
         cmd += ["--inp", inp]
+    if args.draft_model:
+        cmd += ["--draft-model", args.draft_model]
     print(f"running {name} ...", flush=True)
     subprocess.run(cmd, check=True)
     with open(out) as f:
@@ -214,7 +219,9 @@ def main(args):
         gaps = call_worker("referee", os.path.join(tmp, "gaps.json"), args, inp=os.path.join(tmp, "all.json"))
 
     num_prompts = len(results["eager"])
-    print(f"\n{num_prompts} prompts, tolerance {args.tol}")
+    self_draft = not args.draft_model or os.path.realpath(args.draft_model) == os.path.realpath(args.model)
+    print(f"\n{num_prompts} prompts, tolerance {args.tol}, model {args.model}, "
+          f"draft model {'the model itself' if self_draft else args.draft_model}")
     print(f"{'variant':24s} {'tokens':>6s} {'not top-1':>9s} {'worst gap':>9s} {'same as eager':>13s}  verdict")
     all_ok = True
     for name in names:
@@ -233,10 +240,12 @@ def main(args):
             # otherwise the variant would test nothing new
             note += f"  (mixed steps {runs[name]['mixed_steps']}, must be > 0)"
             ok &= runs[name]["mixed_steps"] > 0
-        if name in MIN_ACCEPTANCE:
+        if name in MIN_ACCEPTANCE and self_draft:
             acceptance = runs[name]["acceptance"]
             note += f"  (acceptance per tested guess {acceptance:.3f}, must be >= {MIN_ACCEPTANCE[name]})"
             ok &= acceptance >= MIN_ACCEPTANCE[name]
+        elif runs[name].get("acceptance") is not None:
+            note += f"  (acceptance per tested guess {runs[name]['acceptance']:.3f})"
         all_ok &= ok
         print(f"{name:24s} {len(flat):6d} {not_top1:9d} {worst:9.4f} {same:>6d}/{num_prompts:<6d}  {'OK' if ok else 'FAIL'}{note}")
         if worst > args.tol:
@@ -251,6 +260,7 @@ def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--model", default=os.environ.get("MODEL", os.path.expanduser("~/huggingface/Qwen3-0.6B/")))
+    p.add_argument("--draft-model", default=os.environ.get("DRAFT_MODEL"), help="spec_draft variants: the model that guesses (default: --model itself)")
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--tol", type=float, default=0.5, help="max allowed fp32 logit gap below top-1")
     p.add_argument("--variants", nargs="+", choices=list(VARIANTS), default=list(VARIANTS))
