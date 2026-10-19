@@ -52,7 +52,11 @@ The rate checked is accepted / (accepted + rejections), the chance that a tested
 accepted / proposed: that one falls as k grows (after one bf16 flip the rest of the step's guesses all
 count as not accepted), e.g. 0.969 at k=4 but 0.942 at k=8 for the same per-guess rate ~0.9875.
 
-Usage: python tests/test_greedy.py [--model PATH] [--draft-model PATH] [--max-tokens N] [--tol T] [--variants NAME ...]
+--num-prompts 30 makes decode batches bigger than 16. Before P5b2, plain decode in eager didn't pad its batch the way
+CUDA graphs do (10 requests: 10 vs 16); with 0.6B's matrix shapes cuBLAS gives the same numbers at batch <= 16, so the
+10 prompts passed, but 30 prompts showed graph = eager on only 6/30 (see DEVLOG, P5b2).
+
+Usage: python tests/test_greedy.py [--model PATH] [--draft-model PATH] [--max-tokens N] [--num-prompts N] [--tol T] [--variants NAME ...]
 """
 import argparse
 import json
@@ -105,16 +109,17 @@ CONTEXT_QUESTIONS = [
 ]
 
 
-def build_prompts(model):
+def build_prompts(model, num_prompts=None):
+    """The 10 test prompts; with num_prompts > 10, followed by the same questions again, numbered so they differ."""
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model)
 
     def chat(text):
         return tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=True, add_generation_prompt=True)
 
-    prompts = [chat(q) for q in QUESTIONS]
-    prompts += [chat(f"{LONG_CONTEXT}\n\nQuestion: {q}") for q in CONTEXT_QUESTIONS]
-    return prompts, tokenizer.eos_token_id
+    texts = QUESTIONS + [f"{LONG_CONTEXT}\n\nQuestion: {q}" for q in CONTEXT_QUESTIONS]
+    texts += [f"{texts[i % len(texts)]} (request {i})" for i in range(len(texts), num_prompts or 0)]
+    return [chat(t) for t in texts], tokenizer.eos_token_id
 
 
 def load_hf(model, dtype):
@@ -178,7 +183,7 @@ def referee(model, prompts, results):
 
 
 def worker(args):
-    prompts, eos = build_prompts(args.model)
+    prompts, eos = build_prompts(args.model, args.num_prompts)
     if args.worker == "referee":
         with open(args.inp) as f:
             result = referee(args.model, prompts, json.load(f))
@@ -191,7 +196,8 @@ def worker(args):
 
 
 def call_worker(name, out, args, inp=None):
-    cmd = [sys.executable, __file__, "--worker", name, "--out", out, "--model", args.model, "--max-tokens", str(args.max_tokens)]
+    cmd = [sys.executable, __file__, "--worker", name, "--out", out, "--model", args.model, "--max-tokens", str(args.max_tokens),
+           "--num-prompts", str(args.num_prompts)]
     if inp:
         cmd += ["--inp", inp]
     if args.draft_model:
@@ -262,6 +268,7 @@ if __name__ == "__main__":
     p.add_argument("--model", default=os.environ.get("MODEL", os.path.expanduser("~/huggingface/Qwen3-0.6B/")))
     p.add_argument("--draft-model", default=os.environ.get("DRAFT_MODEL"), help="spec_draft variants: the model that guesses (default: --model itself)")
     p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--num-prompts", type=int, default=10, help="more than 10: the questions again, numbered (bigger decode batches)")
     p.add_argument("--tol", type=float, default=0.5, help="max allowed fp32 logit gap below top-1")
     p.add_argument("--variants", nargs="+", choices=list(VARIANTS), default=list(VARIANTS))
     p.add_argument("--worker", choices=list(VARIANTS) + ["referee"])

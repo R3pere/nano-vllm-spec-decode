@@ -14,6 +14,14 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+# torch.compile (RMSNorm, rotary, SiluAndMul, Sampler) keeps at most recompile_limit compiled versions of a function
+# (one per tensor rank, hidden size, static/dynamic shape, default device...). Past the limit it silently runs the
+# function uncompiled, which rounds differently: Qwen3-8B with a 0.6B draft model went past the default 8 for
+# rms_forward while recording CUDA graphs, so graphs and eager gave different tokens (P5b2). Allow plenty, and fail
+# loudly instead of changing numbers if that is ever not enough.
+torch._dynamo.config.recompile_limit = 64
+torch._dynamo.config.fail_on_recompile_limit_hit = True
+
 
 def batch_buckets(max_bs: int) -> list[int]:
     """Batch sizes CUDA graphs are recorded for: 1, 2, 4, 8, then every 16, then max_bs itself."""
@@ -328,12 +336,14 @@ class ModelRunner:
             positions.extend(range(start, end))
             context_lens.append(end)
             slot_mapping.extend(seq.block_table[i // self.block_size] * self.block_size + i % self.block_size for i in range(start, end))
-        # With speculative decoding, pad the batch with empty sequences up to a size CUDA graphs are recorded
-        # for, also when running eagerly. cuBLAS and flash-attn results depend slightly on the batch size, so
-        # this way eager and graph compute exactly the same thing and give the same tokens. Empty sequences
-        # write no KV (slot -1) and see nothing (length 0); their outputs are dropped.
+        # Pad the batch with empty sequences up to a size CUDA graphs are recorded for, also when running eagerly.
+        # cuBLAS results depend slightly on the batch size, so this way eager and graph compute exactly the same
+        # thing and give the same tokens. Empty sequences write no KV (slot -1) and see nothing (length 0); their
+        # outputs are dropped. (Until P5b2 only with speculative decoding: plain decode then ran 10 requests as 10
+        # in eager but 16 in a graph, which gave different tokens on Qwen3-8B, whose down_proj GEMM changes kernel
+        # between batch 10 and 16; 0.6B's shapes don't at batch <= 16, which hid it.)
         num_padding = 0
-        sizes = self.graph_bs[which].get(num_query_tokens) if self.config.speculative_method else None
+        sizes = self.graph_bs[which].get(num_query_tokens)
         if sizes and len(seqs) <= sizes[-1]:
             num_padding = next(x for x in sizes if x >= len(seqs)) - len(seqs)
             input_ids += [0] * (num_padding * num_query_tokens)
