@@ -1,6 +1,6 @@
 # 项目报告：在 nano-vllm 上做投机解码和混合批处理
 
-> 写给面试官，也写给以后的自己。所有数字都来自 `results/` 下的原始 JSON（`results/` 不进 git，结果包见文末），每个数字都注明硬件、模型、负载、重复次数和复现命令。过程细节在 `docs/DEVLOG.md`。
+> 写给面试官，也写给以后的自己。所有数字都来自租卡结果包里的原始 JSON（结果包已提交在 `benchmarks/`，见文末），每个数字都注明硬件、模型、负载、重复次数和复现命令。过程细节在 `docs/DEVLOG.md`。
 
 ## 1. 一句话
 
@@ -159,7 +159,7 @@ RTX 3060 Laptop 6GB + Qwen3-0.6B，只作补充，这台笔记本不同时间的
 2. **torch.compile 的算子融合**：vLLM 0.15.1 对整个模型做 torch.compile（norm、激活、残差加等融合），nano 只对 RMSNorm、rotary、SiluAndMul、采样这几个函数单独编译。
 3. KV 块大小不同（nano 256、vLLM 16）影响 attention kernel 的切分，影响方向不确定。
 
-公平性上已知的其他差别：KV 容量 nano 39～40 万 token、vLLM 约 38.7 万 token（nano 多 1%～4%）；投机时 vLLM 自动关闭 async scheduling；nano 在一步超过 `512 // (1+k)` 个请求时不猜，vLLM 一直猜。所以投机解码在 ShareGPT 上不和 vLLM 比速度（两边调度和门槛都不同），只在第 5.1 节和自己的不投机比。
+公平性上已知的其他差别：为了让两个引擎走同一套客户端循环，vLLM 以**进程内模式**运行（`scripts/vllm_adapter.py` 设了 `VLLM_ENABLE_V1_MULTIPROCESSING=0`），而正常部署时 vLLM V1 把引擎核心放在单独的进程里，让 CPU 工作和 GPU 计算重叠，所以这里测到的 vLLM 可能略低于它的最佳状态（8B 这种 GPU 占主导的负载下影响应该不大，没有单独测）；KV 容量 nano 39～40 万 token、vLLM 约 38.7 万 token（nano 多 1%～4%）；投机时 vLLM 自动关闭 async scheduling；nano 在一步超过 `512 // (1+k)` 个请求时不猜，vLLM 一直猜。所以投机解码在 ShareGPT 上不和 vLLM 比速度（两边调度和门槛都不同），只在第 5.1 节和自己的不投机比。
 
 ## 7. 负面结果和已知局限
 
@@ -184,5 +184,5 @@ RTX 3060 Laptop 6GB + Qwen3-0.6B，只作补充，这台笔记本不同时间的
 ## 9. 花费和结果包
 
 - 两次租卡共 **59 元**（P5b 44 元，其中约 15 元是空等用户回复；P5b3 15 元），预算上限 100 元。
-- 结果包：`results/p5_20261015_2330.tar.gz`（P5b，解开在 `results/p5b_extract/p5/`）和 `results/p5b3_20261019_2210.tar.gz`（P5b3，解开在 `results/p5b3_extract/p5b3/`）。每个包里有每格的 JSON 和日志、`tables.md`、`env/`（nvidia-smi、两套 pip freeze、git 提交号）、`rates.json`、`sharegpt_sample.json`。
+- 结果包：`benchmarks/p5_20261015_2330.tar.gz`（P5b）和 `benchmarks/p5b3_20261019_2210.tar.gz`（P5b3），校验和在 `benchmarks/SHA256SUMS`。文中引用的 `results/p5b_extract/p5/`、`results/p5b3_extract/p5b3/` 就是这两个包解开后的目录：`mkdir -p results/p5b_extract results/p5b3_extract && tar -xzf benchmarks/p5_20261015_2330.tar.gz -C results/p5b_extract && tar -xzf benchmarks/p5b3_20261019_2210.tar.gz -C results/p5b3_extract`。每个包里有每格的 JSON 和日志、`tables.md`、`env/`（nvidia-smi、两套 pip freeze、git 提交号）、`rates.json`、`sharegpt_sample.json`。
 - 环境脚本 `scripts/setup_remote.sh`，操作手册 `docs/REMOTE.md`。
