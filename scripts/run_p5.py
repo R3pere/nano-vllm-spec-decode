@@ -23,12 +23,23 @@ Order (most important first, in case time runs out):
   repeats      the key cells (all ShareGPT cells; spec copy/chat T0 c1 and copy T0 c16; mixed graph and
                mixed512 at both rates) run twice more, after everything else, so drift over the session
                shows up as spread instead of bias
+  budget       (P5b3, not in the default list) ShareGPT, nano-vllm's mixed batching at token budgets 2048 / 4096 /
+               8192 / 16384 against vLLM at the same budgets (P5b only had nano at 512, vLLM at 16384), all at once
+               and at P5b's two Poisson rates; budgets 2048 and 16384 repeated --repeats times. Then once each:
+               nano-vllm's upstream scheduling (to tie this session to P5b's table) and mixed 2048 + n-gram
+               dynamic k; then scripts/profile_mixed.py at budgets 512 and 2048 (phases of a mixed step, in the
+               log); then the repeats. Before it, correctness30: tests/test_greedy.py --num-prompts 30 on the eager/graph pairs
+               (decode batches up to 30, the case that hid the P5b mismatch), and scripts/check_padding.py.
 Then everything is packed into results/p5_<date>.tar.gz. --table-only prints the summary tables.
+--reuse DIR copies rates.json and sharegpt_sample.json from an earlier result folder (P5b's), so the Poisson rates
+and the requests are exactly the same as there.
 
 --smoke shrinks every run (few requests, short outputs) so the whole script can be rehearsed on a small GPU.
 
 Usage: python scripts/run_p5.py --model PATH --draft-model PATH --vllm-python PATH --sharegpt RAW.json
                                 [--out results/p5] [--smoke] [--sections ...] [--repeats 3] [--dry-run] [--table-only]
+P5b3:  bash scripts/run_p5.sh --out results/p5b3 --reuse /data/p5b_reuse --sections env correctness budget
+       (/data/p5b_reuse: rates.json and sharegpt_sample.json of P5b, uploaded with the code; results/ isn't in git)
 """
 import argparse
 import datetime
@@ -42,6 +53,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SECTIONS = ["env", "correctness", "sharegpt", "spec", "mixed", "step_cost", "repeats"]
+EXTRA_SECTIONS = ["budget"]    # P5b3, only when asked for
 
 # sizes: full run on the rented GPU / --smoke rehearsal
 FULL = dict(
@@ -83,6 +95,12 @@ SHAREGPT_CONFIGS = {    # (engine, extra bench.py arguments)
 }
 SHAREGPT_DRAFT = {"nano_draft": ("nanovllm", ["--spec", "draft", "--k", "4", "DRAFT"]),
                   "vllm_draft": ("vllm", ["--spec", "draft", "--k", "4", "DRAFT"])}
+BUDGETS = [2048, 16384, 4096, 8192]    # most important first; the first two are BUDGET_KEY
+BUDGET_KEY = [2048, 16384]
+BUDGET_EXTRA = {"nano_plain": ("nanovllm", []),
+                "nano_mixed2048_ngram_dynk": ("nanovllm", ["--mixed", "--max-num-batched-tokens", "2048", "--spec", "ngram", "--k", "8", "--dynamic-k"])}
+# the eager/graph pairs of tests/test_greedy.py's MUST_MATCH
+PAIR_VARIANTS = ["eager", "graph", "spec_ngram", "spec_ngram_graph", "spec_draft", "spec_draft_graph", "mixed_eager", "mixed_graph"]
 
 
 class Runner:
@@ -196,6 +214,11 @@ class Runner:
     def correctness(self):
         self.run("correctness", [sys.executable, "tests/test_greedy.py", "--model", self.args.model,
                                  "--draft-model", self.args.draft_model] + self.size["test_args"], kind="check")
+        if "budget" in self.args.sections:
+            args = self.size["test_args"][:2] if self.args.smoke else []    # smoke: keep only --max-tokens 32
+            self.run("correctness30", [sys.executable, "tests/test_greedy.py", "--model", self.args.model, "--draft-model",
+                                       self.args.draft_model, "--num-prompts", "30", "--variants"] + PAIR_VARIANTS + args, kind="check")
+            self.run("check_padding", [sys.executable, "scripts/check_padding.py"], kind="check")    # this GPU's kernels, in the log
 
     def sharegpt_sample(self):
         sample = os.path.join(self.out, "sharegpt_sample.json")
@@ -281,6 +304,34 @@ class Runner:
             self.spec(rep, only_repeated=True)
             self.mixed(rep, only_repeated=True)
 
+    def budget(self):
+        sample = self.sharegpt_sample()
+        if not sample:
+            return
+        all_args = ["--workload", "sharegpt", "--dataset", sample, "--temperature", "0"]
+        n_all, n_rate = self.size["sharegpt_all"], self.size["sharegpt_rate"]
+        rates = self.rates("sharegpt", "sharegpt_nano_plain_all_r1")
+        if not rates:    # no --reuse: measure the rates here, as P5b did
+            self.bench("sharegpt_nano_plain_all_r1", all_args + ["--num-seqs", str(n_all)])
+            rates = self.rates("sharegpt", "sharegpt_nano_plain_all_r1")
+        for rep in range(1, self.args.repeats + 1):
+            configs = {}
+            for b in BUDGETS if rep == 1 else BUDGET_KEY:
+                configs[f"nano_mixed{b}"] = ("nanovllm", ["--mixed", "--max-num-batched-tokens", str(b)])
+                if self.args.vllm_python:
+                    configs[f"vllm_b{b}"] = ("vllm", ["--max-num-batched-tokens", str(b)])
+            if rep == 1:
+                configs.update(BUDGET_EXTRA)
+            for config, (engine, extra) in configs.items():
+                for load in ("all", "lo", "hi") if rates else ("all",):
+                    load_args = ["--num-seqs", str(n_all)] if load == "all" else ["--num-seqs", str(n_rate), "--rate", f"{rates[load]:.3f}"]
+                    self.bench(f"budget_{config}_{load}_r{rep}", all_args + load_args + extra, engine)
+            if rep == 1:
+                # where a mixed step's time goes on this GPU (P5b: a <= 512-token mixed step took 82ms, a 512-token prefill 42ms)
+                for b in (512, 2048):
+                    self.run(f"profile_mixed_{b}", [sys.executable, "scripts/profile_mixed.py", "--model", self.args.model, "--budget", str(b),
+                                                    "--num-seqs", "12" if self.args.smoke else "48"], kind="check")
+
     def package(self):
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
         tar_path = os.path.join(os.path.dirname(os.path.abspath(self.out)), f"{os.path.basename(os.path.abspath(self.out))}_{stamp}.tar.gz")
@@ -357,7 +408,8 @@ def main():
     p.add_argument("--sharegpt", default=os.environ.get("SHAREGPT"), help="ShareGPT_V3_unfiltered_cleaned_split.json")
     p.add_argument("--out", default=os.path.join(ROOT, "results", "p5"))
     p.add_argument("--smoke", action="store_true", help="tiny runs, to rehearse the whole script on a small GPU")
-    p.add_argument("--sections", nargs="+", choices=SECTIONS, default=SECTIONS)
+    p.add_argument("--sections", nargs="+", choices=SECTIONS + EXTRA_SECTIONS, default=SECTIONS)
+    p.add_argument("--reuse", help="earlier result folder: copy its rates.json and sharegpt_sample.json (same rates, same requests)")
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--dry-run", action="store_true", help="print the runs that are still to do")
     p.add_argument("--table-only", action="store_true")
@@ -376,6 +428,10 @@ def main():
         SHAREGPT_DRAFT.pop("vllm_draft")
 
     runner = Runner(args)
+    if args.reuse:
+        for file in ("rates.json", "sharegpt_sample.json"):
+            if not os.path.exists(os.path.join(args.out, file)):
+                shutil.copy(os.path.join(args.reuse, file), os.path.join(args.out, file))
     start = time.time()
     for section in args.sections:
         print(f"\n===== {section} ({datetime.datetime.now():%H:%M:%S})", flush=True)
