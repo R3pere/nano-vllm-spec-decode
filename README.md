@@ -1,13 +1,13 @@
-## 投机解码 + 混合批处理
+# nano-vllm-spec-decode
 
-基于上游 nano-vllm（bb823b3）做的个人项目，加了两块：
+在 nano-vllm 上加了两块：
 
 - 投机解码：n-gram 和小模型草拟两种，支持贪心和随机采样，验证步走 CUDA Graph，按接受率动态选草拟长度 k。
 - vLLM V1 式的混合批处理：prefill 和 decode 放在同一步里算，配合分段 CUDA Graph。
 
 在 A100 + Qwen3-8B 上和 vLLM 0.15.1 用同一套客户端做了对比。设计、负面结果和每个数字的复现命令都在 [docs/REPORT.md](docs/REPORT.md)。
 
-### 结果
+## 结果
 
 A100-SXM4-80GB，目标模型 Qwen3-8B，草拟模型 Qwen3-0.6B，BF16。
 
@@ -22,7 +22,7 @@ A100-SXM4-80GB，目标模型 Qwen3-8B，草拟模型 Qwen3-0.6B，BF16。
 
 全部实验用 `bash scripts/run_p5.sh` 跑，同预算对比用 `bash scripts/run_p5.sh --sections env correctness budget --reuse <P5b 结果目录>`。单个数字对应的 `bench.py` 命令见 REPORT 第 4 节。
 
-### 用法
+## 用法
 
 ```python
 LLM(path, speculative_method="ngram", num_speculative_tokens=4)          # n-gram 投机解码
@@ -52,73 +52,15 @@ MODEL=/path/to/Qwen3-0.6B python scripts/profile_decode.py --spec ngram   # 一�
 
 `bench.py` 新增了照抄型任务（`--workload copy`）、普通问答（`--workload chat`）、随机猜的最坏情况（`--spec-proposer random`）、并发上限（`--concurrency`），以及 `--spec draft --draft-model 路径`、`--dynamic-k`。
 
+## 安装
+
+需要 Python 3.10–3.12、CUDA GPU，依赖见 `pyproject.toml`（torch、triton、transformers、flash-attn、xxhash）。
+
+```bash
+pip install -e .
+huggingface-cli download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B/
+```
+
 ---
 
-以下是上游 README 原文。
-
-<p align="center">
-<img width="300" src="assets/logo.png">
-</p>
-
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
-
-# Nano-vLLM
-
-A lightweight vLLM implementation built from scratch.
-
-## Key Features
-
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
-
-## Installation
-
-```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
-```
-
-## Model Download
-
-To download the model weights manually, use the following command:
-```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
-```
-
-## Quick Start
-
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
-```python
-from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
-outputs[0]["text"]
-```
-
-## Benchmark
-
-See `bench.py` for benchmark.
-
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
-
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+基于 [GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)（MIT 许可，提交 bb823b3），模型、分页 KV 缓存、前缀缓存等基础部分来自上游。
